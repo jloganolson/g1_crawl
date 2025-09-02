@@ -1,0 +1,7 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+
+Whenever running python in this project, use the `g1-crawl` conda env (e.g. `conda activate g1-crawl && python test.py`)
