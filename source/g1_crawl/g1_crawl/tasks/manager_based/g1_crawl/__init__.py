@@ -13,7 +13,7 @@ from . import agents
 
 
 gym.register(
-    id="Template-G1-Crawl-v0",
+    id="g1-crawl-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
