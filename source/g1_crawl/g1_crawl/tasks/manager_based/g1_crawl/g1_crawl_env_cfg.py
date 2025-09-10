@@ -222,19 +222,18 @@ class EventCfg:
         },
     )
 
-    _ROTATION_RANGE_VALUE = 0.5
     reset_base = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {"x": (-_ROTATION_RANGE_VALUE, _ROTATION_RANGE_VALUE), "y": (-_ROTATION_RANGE_VALUE, _ROTATION_RANGE_VALUE), "yaw": (-3.14, 3.14)},
+            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
             "velocity_range": {
                 "x": (-0.5, 0.5),
                 "y": (-0.5, 0.5),
                 "z": (-0.5, 0.5),
-                "roll": (-_ROTATION_RANGE_VALUE, _ROTATION_RANGE_VALUE),
-                "pitch": (-_ROTATION_RANGE_VALUE, _ROTATION_RANGE_VALUE),
-                "yaw": (-_ROTATION_RANGE_VALUE, _ROTATION_RANGE_VALUE),
+                "roll": (-0.5, 0.5),
+                "pitch": (-0.5, 0.5),
+                "yaw": (-0.5, 0.5),
             },
         },
     )
@@ -310,8 +309,8 @@ class RewardsCfg:
         func=mdp.feet_slide, 
         weight=-1.0,
                 params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["*.ankle_roll_link", "*.wrist_link"]),
-            "asset_cfg": SceneEntityCfg("robot", body_names=["*.ankle_roll_link", "*.wrist_link"]),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
+            "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
         },
     )
 
