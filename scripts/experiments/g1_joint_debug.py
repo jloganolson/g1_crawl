@@ -96,6 +96,60 @@ def get_joint_info(scene):
     print("=" * 100)
 
 
+def print_joint_limits_info(scene):
+    """Print per-joint position limits and current violations (outside soft/hard limits)."""
+    robot = scene["Robot"]
+    joint_names = robot.data.joint_names
+    # Try preferred soft limits first, then fall back
+    limits = None
+    limits_label = None
+    try:
+        limits = robot.data.soft_joint_pos_limits[0]
+        limits_label = "soft_joint_pos_limits"
+    except Exception:
+        try:
+            limits = robot.data.joint_pos_limits[0]
+            limits_label = "joint_pos_limits"
+        except Exception:
+            try:
+                limits = robot.data.hard_joint_pos_limits[0]
+                limits_label = "hard_joint_pos_limits"
+            except Exception:
+                limits = None
+                limits_label = None
+
+    print("\n" + "=" * 100)
+    print("JOINT LIMITS AND VIOLATIONS")
+    if limits is None:
+        print("Limits tensor not available on robot.data (no soft/hard limits exposed).")
+        print("=" * 100)
+        return
+
+    joint_pos = robot.data.joint_pos[0]
+    lower = limits[:, 0]
+    upper = limits[:, 1]
+
+    below = torch.clamp(lower - joint_pos, min=0.0)
+    above = torch.clamp(joint_pos - upper, min=0.0)
+    violation = below + above
+    total_violation = torch.sum(violation)
+
+    print(f"Using limits tensor: {limits_label}")
+    print("\nIndex | Joint Name                   |   Curr     Lower     Upper    Below    Above | Violation")
+    print("-" * 100)
+    for i, name in enumerate(joint_names):
+        curr_i = float(joint_pos[i])
+        lo_i = float(lower[i])
+        hi_i = float(upper[i])
+        below_i = float(below[i])
+        above_i = float(above[i])
+        viol_i = float(violation[i])
+        print(f"{i:5d} | {name:30s} | {curr_i:7.4f}  {lo_i:7.4f}  {hi_i:7.4f}  {below_i:7.4f}  {above_i:7.4f} | {viol_i:8.4f}")
+    print("-" * 100)
+    print(f"Total violation (L1 sum): {float(total_violation):.6f}")
+    print("=" * 100)
+
+
 def apply_debug_joint_values(scene):
     """Apply the specific joint values from the screenshot for debugging."""
     
@@ -394,8 +448,8 @@ def compare_joint_orders():
 def run_debug_visualization(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     """Run the debug visualization with keyboard controls."""
     # Load poses
-    # poses_path = "/home/logan/Projects/g1_crawl/scripts/experiments/poses.json"
-    poses_path = "/home/logan/Projects/g1_crawl/scripts/experiments/gravity-test.json"
+    poses_path = "/home/logan/Projects/g1_crawl/scripts/experiments/poses.json"
+    # poses_path = "/home/logan/Projects/g1_crawl/scripts/experiments/gravity-test.json"
     try:
         poses = load_poses_from_json(poses_path)
         if len(poses) == 0:
@@ -409,6 +463,7 @@ def run_debug_visualization(sim: sim_utils.SimulationContext, scene: Interactive
 
     # Print joint information
     get_joint_info(scene)
+    print_joint_limits_info(scene)
     compare_joint_orders()
 
     # Apply initial pose or fallback
@@ -465,6 +520,7 @@ def run_debug_visualization(sim: sim_utils.SimulationContext, scene: Interactive
                 keys_pressed["I"] = True
                 print("\n[DEBUG] Printing joint info...")
                 get_joint_info(scene)
+                print_joint_limits_info(scene)
             elif event.input.name == "N" and not keys_pressed["N"]:
                 keys_pressed["N"] = True
                 if poses is not None and len(poses) > 0:
@@ -498,7 +554,7 @@ def run_debug_visualization(sim: sim_utils.SimulationContext, scene: Interactive
     print("Controls:")
     print("  R - Reset to default pose")
     print("  D - Apply debug joint values from screenshot")
-    print("  I - Print joint information")
+    print("  I - Print joint and limits information")
     print("  N - Next pose from poses.json")
     print("  P - Previous pose from poses.json")
     print("  ESC - Exit")

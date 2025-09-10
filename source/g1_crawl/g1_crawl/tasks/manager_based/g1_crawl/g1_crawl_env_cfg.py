@@ -103,7 +103,7 @@ class CommandsCfg:
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.5, use_default_offset=True)
+    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.0, use_default_offset=True)
 
 
 @configclass
@@ -212,29 +212,29 @@ class EventCfg:
         },
     )
     # reset
-    base_external_force_torque = EventTerm(
-        func=mdp.apply_external_force_torque,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
-            "force_range": (0.0, 0.0),
-            "torque_range": (-0.0, 0.0),
-        },
-    )
+    # base_external_force_torque = EventTerm(
+    #     func=mdp.apply_external_force_torque,
+    #     mode="reset",
+    #     params={
+    #         "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+    #         "force_range": (0.0, 0.0),
+    #         "torque_range": (-0.0, 0.0),
+    #     },
+    # )
 
     reset_base = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
+            "pose_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)},
             "velocity_range": {
-                "x": (-0.5, 0.5),
-                "y": (-0.5, 0.5),
-                "z": (-0.5, 0.5),
-                "roll": (-0.5, 0.5),
-                "pitch": (-0.5, 0.5),
-                "yaw": (-0.5, 0.5),
-            },
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            }
         },
     )
 
@@ -242,7 +242,7 @@ class EventCfg:
         func=mdp.reset_joints_by_scale,
         mode="reset",
         params={
-            "position_range": (0.5, 1.5),
+            "position_range": (1.0, 1.0),
             "velocity_range": (0.0, 0.0),
         },
     )
@@ -270,7 +270,7 @@ class RewardsCfg:
     lin_vel_l2 = RewTerm(func=mdp.lin_vel_l2, weight=-5.0)
     ang_vel_l2 = RewTerm(func=mdp.ang_vel_l2, weight=-5.0)
 
-    flat_orientation_l2 = RewTerm(func=mdp.align_projected_gravity_plus_x_l2, weight=1.0)
+    flat_orientation_l2 = RewTerm(func=mdp.align_projected_gravity_plus_x_l2, weight=.1)
     
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
     
@@ -279,7 +279,7 @@ class RewardsCfg:
         func=mdp.base_height_l2,
         weight=-.1,
         params={
-            "target_height": 0.427,
+            "target_height": 0.22,
             "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
         },
     )
@@ -305,14 +305,14 @@ class RewardsCfg:
     #regulatorization
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-2)
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-4)
-    slippage = RewTerm(
-        func=mdp.feet_slide, 
-        weight=-1.0,
-                params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
-            "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
-        },
-    )
+    # slippage = RewTerm(
+    #     func=mdp.feet_slide, 
+    #     weight=-.01,
+    #             params={
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
+    #         "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
+    #     },
+    # )
 
 
 @configclass
@@ -378,19 +378,7 @@ class G1CrawlEnvCfg(ManagerBasedRLEnvCfg):
 
         # Randomization
 
-        self.events.reset_robot_joints.params["position_range"] = (0.9, 1.1)
-        self.events.base_external_force_torque.params["asset_cfg"].body_names = ["torso_link"]
-        self.events.reset_base.params = {
-            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
-            "velocity_range": {
-                "x": (0.0, 0.0),
-                "y": (0.0, 0.0),
-                "z": (0.0, 0.0),
-                "roll": (0.0, 0.0),
-                "pitch": (0.0, 0.0),
-                "yaw": (0.0, 0.0),
-            },
-        }
+        # self.events.base_external_force_torque.params["asset_cfg"].body_names = ["torso_link"]
 
         # Rewards
         # self.rewards.track_ang_vel_z_exp.weight = 1.0

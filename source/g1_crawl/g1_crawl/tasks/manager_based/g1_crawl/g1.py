@@ -42,7 +42,7 @@ G1_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.428), #.4267 according to 
+        pos=(0.0, 0.0, 0.22), #.4267 according to 
         rot=(0.721249, -0.000001, 0.692676, -0.000012), # rpy(rad): [-0.000456, 1.530386, -0.000471]
         joint_pos={
             # Hip joints - identical pitch, inverse roll/yaw for left/right
