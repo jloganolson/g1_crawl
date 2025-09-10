@@ -42,16 +42,36 @@ G1_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.76),
+        pos=(0.0, 0.0, 0.428), #.4267 according to 
+        rot=(0.721249, -0.000001, 0.692676, -0.000012), # rpy(rad): [-0.000456, 1.530386, -0.000471]
         joint_pos={
-            ".*_hip_pitch_joint": -0.312,
-            ".*_knee_joint": 0.669,
-            ".*_ankle_pitch_joint": -0.363,
-            ".*_elbow_joint": 0.6,
-            "left_shoulder_roll_joint": 0.2,
-            "left_shoulder_pitch_joint": 0.2,
-            "right_shoulder_roll_joint": -0.2,
-            "right_shoulder_pitch_joint": 0.2,
+            # Hip joints - identical pitch, inverse roll/yaw for left/right
+            ".*_hip_pitch_joint": -1.6796101123595506,
+            "left_hip_roll_joint": 2.4180011235955052,
+            "right_hip_roll_joint": -2.4180011235955052,
+            "left_hip_yaw_joint": 1.2083865168539325,
+            "right_hip_yaw_joint": -1.2083865168539325,
+            
+            # Knee joints - identical for both legs
+            ".*_knee_joint": 2.1130298764044944,
+            
+            # Ankle joints - identical pitch, zero roll
+            ".*_ankle_pitch_joint": 0.194143033707865,
+            ".*_ankle_roll_joint": 0.0,
+            
+            # Waist
+            "waist_yaw_joint": 0.0,
+            
+            # Shoulder joints - identical pitch, inverse roll/yaw for left/right
+            ".*_shoulder_pitch_joint": 1.4578526315789473,
+            "left_shoulder_roll_joint": 1.5778684210526317,
+            "right_shoulder_roll_joint": -1.5778684210526317,
+            "left_shoulder_yaw_joint": 1.4238245614035088,
+            "right_shoulder_yaw_joint": -1.4238245614035088,
+            
+            # Elbow and wrist joints - identical for both arms
+            ".*_elbow_joint": -0.3124709677419355,
+            ".*_wrist_roll_joint": 0.0,
         },
         joint_vel={".*": 0.0},
     ),

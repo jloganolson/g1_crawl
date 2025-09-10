@@ -46,17 +46,42 @@ def get_joint_info(scene):
     """Print detailed joint information for debugging."""
     robot = scene["Robot"]
     joint_names = robot.data.joint_names
-    joint_pos = robot.data.joint_pos[0]  # First environment
-    
-    print("=" * 80)
-    print("G1 ROBOT JOINT INFORMATION")
-    print("=" * 80)
+    joint_pos = robot.data.joint_pos[0]
+
+    # Base orientation in world frame
+    base_quat = robot.data.root_quat_w[0]
+    roll, pitch, yaw = _quat_to_euler_rpy(base_quat)
+
+    print("=" * 100)
+    print("G1 ROBOT STATE")
+    print("=" * 100)
+    print("Base orientation:")
+    print(f"  Quaternion [w, x, y, z]: {[float(q) for q in base_quat]}")
+    print(f"  Euler RPY [rad]: roll={roll:.4f}, pitch={pitch:.4f}, yaw={yaw:.4f}")
+    print("")
+
+    # Print joints: current and target (if available)
     print(f"Total joints: {len(joint_names)}")
-    print("\nJoint Index | Joint Name | Current Position")
-    print("-" * 60)
-    for i, (name, pos) in enumerate(zip(joint_names, joint_pos)):
-        print(f"{i:11d} | {name:30s} | {pos:8.4f}")
-    print("=" * 80)
+    print("\nJoint Index | Joint Name                   | Current    | Target")
+    print("-" * 100)
+
+    # Try to read last commanded targets: fall back to current if not present
+    joint_target = None
+    # Not all backends expose targets; we keep None-safe printing
+    try:
+        # Some implementations keep last command accessible via data.joint_pos_target
+        joint_target = robot.data.joint_pos_target[0]
+    except Exception:
+        joint_target = None
+
+    for i, name in enumerate(joint_names):
+        curr = float(joint_pos[i])
+        targ = float(joint_target[i]) if joint_target is not None else float('nan')
+        if joint_target is None:
+            print(f"{i:11d} | {name:30s} | {curr:10.4f} |    n/a")
+        else:
+            print(f"{i:11d} | {name:30s} | {curr:10.4f} | {targ:7.4f}")
+    print("=" * 100)
 
 
 def apply_debug_joint_values(scene):
@@ -145,6 +170,31 @@ def _euler_rpy_to_quat(roll, pitch, yaw, device):
     y = cr * sp * cy + sr * cp * sy
     z = cr * cp * sy - sr * sp * cy
     return torch.tensor([w, x, y, z], dtype=torch.float32, device=device)
+
+
+def _quat_to_euler_rpy(quat):
+    """Convert quaternion tensor/list [w, x, y, z] to roll, pitch, yaw (radians)."""
+    # Ensure we have floats
+    if hasattr(quat, "tolist"):
+        w, x, y, z = quat.tolist()
+    else:
+        w, x, y, z = quat
+    # roll (x-axis rotation)
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    # pitch (y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    sinp = max(-1.0, min(1.0, sinp))
+    pitch = math.asin(sinp)
+
+    # yaw (z-axis rotation)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    return roll, pitch, yaw
 
 
 def load_poses_from_json(file_path):
