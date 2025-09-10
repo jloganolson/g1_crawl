@@ -8,11 +8,8 @@
 **/*.dmp
 **/.thumbs
 
-# No USD files allowed in the repo
-**/*.usd
-**/*.usda
-**/*.usdc
-**/*.usdz
+assets/archive
+
 
 # Python
 .DS_Store
