@@ -222,18 +222,19 @@ class EventCfg:
         },
     )
 
+    _ROTATION_RANGE_VALUE = 0.5
     reset_base = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
+            "pose_range": {"x": (-_ROTATION_RANGE_VALUE, _ROTATION_RANGE_VALUE), "y": (-_ROTATION_RANGE_VALUE, _ROTATION_RANGE_VALUE), "yaw": (-3.14, 3.14)},
             "velocity_range": {
                 "x": (-0.5, 0.5),
                 "y": (-0.5, 0.5),
                 "z": (-0.5, 0.5),
-                "roll": (-0.5, 0.5),
-                "pitch": (-0.5, 0.5),
-                "yaw": (-0.5, 0.5),
+                "roll": (-_ROTATION_RANGE_VALUE, _ROTATION_RANGE_VALUE),
+                "pitch": (-_ROTATION_RANGE_VALUE, _ROTATION_RANGE_VALUE),
+                "yaw": (-_ROTATION_RANGE_VALUE, _ROTATION_RANGE_VALUE),
             },
         },
     )
@@ -248,12 +249,12 @@ class EventCfg:
     )
 
     # interval
-    push_robot = EventTerm(
-        func=mdp.push_by_setting_velocity_with_viz,
-        mode="interval",
-        interval_range_s=(2.0, 2.0),
-        params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
-    )
+    # push_robot = EventTerm(
+    #     func=mdp.push_by_setting_velocity_with_viz,
+    #     mode="interval",
+    #     interval_range_s=(2.0, 2.0),
+    #     params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
+    # )
 
 
 
@@ -262,42 +263,32 @@ class RewardsCfg:
     """Reward terms for the MDP."""
 
 
-    feet_on_ground = RewTerm(
-        func=mdp.both_feet_on_ground, 
-        weight=10.0,       
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
-    )
+    # feet_on_ground = RewTerm(
+    #     func=mdp.both_feet_on_ground, 
+    #     weight=10.0,       
+    #     params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
+    # )
     lin_vel_l2 = RewTerm(func=mdp.lin_vel_l2, weight=-5.0)
     ang_vel_l2 = RewTerm(func=mdp.ang_vel_l2, weight=-5.0)
 
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-1.0)
+    flat_orientation_l2 = RewTerm(func=mdp.align_projected_gravity_plus_x_l2, weight=1.0)
+    
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
     
-    # joint_deviation_lower_body = RewTerm(
-    #     func=mdp.joint_deviation_l1,
-    #     weight=-.1,
-    #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=["waist_yaw_joint", ".*_hip_.*_joint", ".*_knee_joint", ".*_ankle_.*_joint"])},
-    # )
     
     base_height_l2 = RewTerm(
         func=mdp.base_height_l2,
         weight=-.1,
         params={
-            "target_height": 0.74,
+            "target_height": 0.427,
             "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
         },
     )
 
-    joint_deviation_hip_waist = RewTerm(
+    joint_deviation_all = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-0.1,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_yaw_joint", ".*_hip_roll_joint", "waist_yaw_joint"])},
-    )
-
-    joint_deviation_upper_body = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.2,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_shoulder_.*_joint", ".*_elbow_joint", ".*_wrist_.*_joint"])},
+        params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
     #limits
@@ -319,8 +310,8 @@ class RewardsCfg:
         func=mdp.feet_slide, 
         weight=-1.0,
                 params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll_link"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["*.ankle_roll_link", "*.wrist_link"]),
+            "asset_cfg": SceneEntityCfg("robot", body_names=["*.ankle_roll_link", "*.wrist_link"]),
         },
     )
 
@@ -415,9 +406,9 @@ class G1CrawlEnvCfg(ManagerBasedRLEnvCfg):
         # )
 
         # Commands
-        # self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)
-        # self.commands.base_velocity.ranges.lin_vel_y = (-1.0, 1.0)
-        # self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
 
         # terminations
         self.terminations.base_contact.params["sensor_cfg"].body_names = "torso_link"

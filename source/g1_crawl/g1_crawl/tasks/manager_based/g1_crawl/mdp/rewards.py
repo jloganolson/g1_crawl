@@ -46,28 +46,6 @@ def feet_air_time(
     return reward
 
 
-def feet_air_time_positive_biped(env, command_name: str, threshold: float, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Reward long steps taken by the feet for bipeds.
-
-    This function rewards the agent for taking steps up to a specified threshold and also keep one foot at
-    a time in the air.
-
-    If the commands are small (i.e. the agent is not supposed to take a step), then the reward is zero.
-    """
-    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    # compute the reward
-    air_time = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids]
-    contact_time = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids]
-    in_contact = contact_time > 0.0
-    in_mode_time = torch.where(in_contact, contact_time, air_time)
-    single_stance = torch.sum(in_contact.int(), dim=1) == 1
-    reward = torch.min(torch.where(single_stance.unsqueeze(-1), in_mode_time, 0.0), dim=1)[0]
-    reward = torch.clamp(reward, max=threshold)
-    # no reward for zero command
-    reward *= torch.norm(env.command_manager.get_command(command_name)[:, :2], dim=1) > 0.1
-    return reward
-
-
 def feet_slide(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Penalize feet sliding.
 
@@ -133,27 +111,6 @@ def both_feet_air(env, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     return both_feet_air.float()
 
 
-def both_feet_on_ground(env, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Reward when both feet are in contact with the ground.
-
-    This function rewards the agent when both feet are in contact with the ground, 
-    encouraging stable bipedal stance. Use with feet_slide penalty to discourage sliding.
-    
-    Args:
-        env: The environment instance.
-        sensor_cfg: Configuration for the contact sensor.
-
-    Returns:
-        1 if both feet are in contact, 0 otherwise.
-    """
-    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    # Check if feet are in contact using contact time
-    contact_time = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids]
-    in_contact = contact_time > 0.0
-    # Count feet in contact
-    both_feet_in_contact = torch.sum(in_contact.int(), dim=1) == 2
-    return both_feet_in_contact.float()
-
 def lin_vel_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Penalize all base linear velocity using L2 squared kernel.
 
@@ -171,3 +128,57 @@ def ang_vel_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCf
     asset: RigidObject = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.root_ang_vel_b[:, :3]), dim=1)
 
+
+def align_projected_gravity_to_target_l2(
+    env: ManagerBasedRLEnv,
+    target: torch.Tensor,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward alignment of projected gravity with an arbitrary target direction in base frame.
+
+    This uses the projected gravity in base frame ``g_b = asset.data.projected_gravity_b`` and
+    a target direction (3,) or per-env targets (num_envs, 3). The target is normalized internally.
+
+    reward = 1 - 0.5 * || g_b - \hat{target} ||^2, yielding values in [-1, 1].
+
+    Args:
+        env: RL environment.
+        target: Desired gravity direction in base frame. Shape (3,) or (num_envs, 3).
+        asset_cfg: Scene entity for the robot asset.
+
+    Returns:
+        Tensor of shape (num_envs,) with alignment rewards in [-1, 1].
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    g_b = asset.data.projected_gravity_b  # (num_envs, 3)
+
+    # Prepare target on correct device/dtype and broadcast if needed
+    if target.dim() == 1:
+        target_b = target.unsqueeze(0).expand(g_b.shape[0], -1)
+    elif target.dim() == 2 and target.shape[0] == g_b.shape[0] and target.shape[1] == 3:
+        target_b = target
+    else:
+        raise ValueError("target must have shape (3,) or (num_envs, 3)")
+    target_b = target_b.to(dtype=g_b.dtype, device=g_b.device)
+
+    # Normalize target direction per env to avoid scale effects
+    target_norm = torch.clamp(torch.norm(target_b, dim=1, keepdim=True), min=1e-6)
+    target_b = target_b / target_norm
+
+    dist_sq = torch.sum(torch.square(g_b - target_b), dim=1)  # in [0, 4]
+    return 1.0 - 0.5 * dist_sq
+
+
+def align_projected_gravity_plus_x_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward alignment of projected gravity with +X axis in base frame using L2 mapping.
+
+    reward = 1 - 0.5 * || g_b - [1, 0, 0] ||^2, in [-1, 1].
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    g_b = asset.data.projected_gravity_b  # (num_envs, 3)
+    target = torch.tensor([1.0, 0.0, 0.0], dtype=g_b.dtype, device=g_b.device)
+    dist_sq = torch.sum(torch.square(g_b - target), dim=1)
+    return 1.0 - 0.5 * dist_sq

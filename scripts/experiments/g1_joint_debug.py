@@ -20,6 +20,12 @@ import carb
 import omni
 
 
+# Configure which base axis corresponds to "belly-forward" alignment with gravity in base frame.
+# For G1, +X (pelvis forward) is desired, so axis='x'. If flipped, set sign=-1.0.
+BELLY_TARGET_AXIS = 'x'  # one of: 'x', 'y', 'z'
+BELLY_TARGET_SIGN = 1.0
+
+
 class DebugSceneCfg(InteractiveSceneCfg):
     """Scene configuration for joint debugging."""
 
@@ -58,7 +64,13 @@ def get_joint_info(scene):
     print("Base orientation:")
     print(f"  Quaternion [w, x, y, z]: {[float(q) for q in base_quat]}")
     print(f"  Euler RPY [rad]: roll={roll:.4f}, pitch={pitch:.4f}, yaw={yaw:.4f}")
+    # Orientation penalty from projected gravity
+    penalty, g_b = _laying_down_orientation_l2_from_quat(base_quat, robot.device)
     print("")
+    print("Laying-down orientation penalty (xy L2 of gravity in base):")
+    print(f"  penalty={float(penalty):.6f}, projected_gravity_b=[{float(g_b[0]):.4f}, {float(g_b[1]):.4f}, {float(g_b[2]):.4f}]")
+    align_reward = _axis_alignment_reward_from_projected_gravity(g_b, robot.device, axis=BELLY_TARGET_AXIS, sign=BELLY_TARGET_SIGN)
+    print(f"  axis_alignment_reward={float(align_reward):.6f} (axis={BELLY_TARGET_AXIS}, sign={BELLY_TARGET_SIGN:+.1f})")
 
     # Print joints: current and target (if available)
     print(f"Total joints: {len(joint_names)}")
@@ -154,6 +166,13 @@ def apply_debug_joint_values(scene):
         print(f"\nJoints using default values: {missing_joints}")
     
     print("=" * 80)
+    # Print current orientation penalty
+    base_quat = robot.data.root_quat_w[0]
+    penalty, g_b = _laying_down_orientation_l2_from_quat(base_quat, robot.device)
+    print(f"Orientation penalty after applying joints: {float(penalty):.6f}")
+    print(f"projected_gravity_b: [{float(g_b[0]):.4f}, {float(g_b[1]):.4f}, {float(g_b[2]):.4f}]")
+    align_reward = _axis_alignment_reward_from_projected_gravity(g_b, robot.device, axis=BELLY_TARGET_AXIS, sign=BELLY_TARGET_SIGN)
+    print(f"axis_alignment_reward: {float(align_reward):.6f}")
 
 
 def _euler_rpy_to_quat(roll, pitch, yaw, device):
@@ -195,6 +214,86 @@ def _quat_to_euler_rpy(quat):
     yaw = math.atan2(siny_cosp, cosy_cosp)
 
     return roll, pitch, yaw
+
+
+def _ensure_quat_tensor(quat, device):
+    """Ensure quaternion is a 4D torch tensor [w, x, y, z] on given device."""
+    if isinstance(quat, torch.Tensor):
+        return quat.to(device=device, dtype=torch.float32)
+    return torch.tensor(quat, dtype=torch.float32, device=device)
+
+
+def _quat_to_rotation_matrix(quat, device):
+    """Convert quaternion [w, x, y, z] to 3x3 rotation matrix (world->body aligns as R)."""
+    q = _ensure_quat_tensor(quat, device)
+    w, x, y, z = q.unbind(-1)
+    # Rotation matrix corresponding to active rotation by q
+    r00 = 1 - 2 * (y * y + z * z)
+    r01 = 2 * (x * y - z * w)
+    r02 = 2 * (x * z + y * w)
+
+    r10 = 2 * (x * y + z * w)
+    r11 = 1 - 2 * (x * x + z * z)
+    r12 = 2 * (y * z - x * w)
+
+    r20 = 2 * (x * z - y * w)
+    r21 = 2 * (y * z + x * w)
+    r22 = 1 - 2 * (x * x + y * y)
+
+    return torch.stack(
+        [
+            torch.stack([r00, r01, r02], dim=-1),
+            torch.stack([r10, r11, r12], dim=-1),
+            torch.stack([r20, r21, r22], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
+def _rotate_vector_by_quat_inverse(quat, vec, device):
+    """Rotate a 3D vector by the inverse of quaternion (i.e., world->body frame transform)."""
+    R = _quat_to_rotation_matrix(quat, device)
+    v = vec if isinstance(vec, torch.Tensor) else torch.tensor(vec, dtype=torch.float32, device=device)
+    return torch.matmul(R.transpose(-2, -1), v)
+
+
+def _laying_down_orientation_l2_from_quat(quat, device):
+    """Compute sum of squared XY components of projected gravity in base frame.
+
+    gravity (world) is assumed to be [0, 0, -1].
+    Returns (penalty_tensor, projected_gravity_b_tensor).
+    """
+    g_w = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32, device=device)
+    g_b = _rotate_vector_by_quat_inverse(quat, g_w, device)
+    penalty = g_b[0] * g_b[0] + g_b[1] * g_b[1]
+    return penalty, g_b
+
+
+def _axis_alignment_reward_from_projected_gravity(
+    g_b: torch.Tensor,
+    device,
+    axis: str = 'x',
+    sign: float = 1.0,
+) -> torch.Tensor:
+    """Reward aligning a chosen base axis with gravity in the base frame.
+
+    - g_b: gravity in base frame (3,)
+    - axis: which base axis to align with gravity: 'x'|'y'|'z'
+    - sign: +1 to align +axis with gravity direction in base, -1 for -axis
+
+    Returns reward in [-1, 1], where 1 is perfect alignment, -1 opposite, ~0 orthogonal.
+    This is equivalent to 2*(axis_dot) - 1 after squaring distance mapping.
+    """
+    if axis == 'x':
+        target = torch.tensor([float(sign), 0.0, 0.0], dtype=torch.float32, device=device)
+    elif axis == 'y':
+        target = torch.tensor([0.0, float(sign), 0.0], dtype=torch.float32, device=device)
+    elif axis == 'z':
+        target = torch.tensor([0.0, 0.0, float(sign)], dtype=torch.float32, device=device)
+    else:
+        raise ValueError("axis must be one of 'x', 'y', 'z'")
+    dist_sq = torch.sum(torch.square(g_b - target))  # in [0, 4]
+    return 1.0 - 0.5 * dist_sq  # maps 0->1, 2->0, 4->-1
 
 
 def load_poses_from_json(file_path):
@@ -242,6 +341,14 @@ def apply_pose(scene: InteractiveScene, pose):
     robot.write_root_velocity_to_sim(root_robot_state[:, 7:])
     robot.set_joint_position_target(joint_positions)
     scene.write_data_to_sim()
+    
+    # Report orientation penalty for this pose
+    base_quat_now = robot.data.root_quat_w[0]
+    penalty, g_b = _laying_down_orientation_l2_from_quat(base_quat_now, device)
+    print("\n[POSE] Orientation penalty:")
+    print(f"  penalty={float(penalty):.6f}, projected_gravity_b=[{float(g_b[0]):.4f}, {float(g_b[1]):.4f}, {float(g_b[2]):.4f}]")
+    align_reward = _axis_alignment_reward_from_projected_gravity(g_b, device, axis=BELLY_TARGET_AXIS, sign=BELLY_TARGET_SIGN)
+    print(f"  axis_alignment_reward={float(align_reward):.6f}")
 
 
 def compare_joint_orders():
@@ -287,7 +394,8 @@ def compare_joint_orders():
 def run_debug_visualization(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     """Run the debug visualization with keyboard controls."""
     # Load poses
-    poses_path = "/home/logan/Projects/g1_crawl/scripts/experiments/poses.json"
+    # poses_path = "/home/logan/Projects/g1_crawl/scripts/experiments/poses.json"
+    poses_path = "/home/logan/Projects/g1_crawl/scripts/experiments/gravity-test.json"
     try:
         poses = load_poses_from_json(poses_path)
         if len(poses) == 0:
@@ -340,6 +448,13 @@ def run_debug_visualization(sim: sim_utils.SimulationContext, scene: Interactive
                 joint_vel = scene["Robot"].data.default_joint_vel.clone()
                 scene["Robot"].write_joint_state_to_sim(joint_pos, joint_vel)
                 scene.write_data_to_sim()
+                # Report orientation penalty after reset
+                base_quat = scene["Robot"].data.root_quat_w[0]
+                penalty, g_b = _laying_down_orientation_l2_from_quat(base_quat, scene["Robot"].device)
+                print(f"[DEBUG] Orientation penalty after reset: {float(penalty):.6f}")
+                print(f"        projected_gravity_b: [{float(g_b[0]):.4f}, {float(g_b[1]):.4f}, {float(g_b[2]):.4f}]")
+                align_reward = _axis_alignment_reward_from_projected_gravity(g_b, scene["Robot"].device, axis=BELLY_TARGET_AXIS, sign=BELLY_TARGET_SIGN)
+                print(f"        axis_alignment_reward: {float(align_reward):.6f}")
                 
             elif event.input.name == "D" and not keys_pressed["D"]:
                 keys_pressed["D"] = True
