@@ -12,6 +12,8 @@ import isaaclab.sim as sim_utils
 
 import torch
 import numpy as np
+import json
+import math
 
 # Add carb and omni for keyboard input handling
 import carb
@@ -129,6 +131,69 @@ def apply_debug_joint_values(scene):
     print("=" * 80)
 
 
+def _euler_rpy_to_quat(roll, pitch, yaw, device):
+    """Convert roll, pitch, yaw (radians) to quaternion [w, x, y, z]."""
+    cr = math.cos(roll * 0.5)
+    sr = math.sin(roll * 0.5)
+    cp = math.cos(pitch * 0.5)
+    sp = math.sin(pitch * 0.5)
+    cy = math.cos(yaw * 0.5)
+    sy = math.sin(yaw * 0.5)
+
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    return torch.tensor([w, x, y, z], dtype=torch.float32, device=device)
+
+
+def load_poses_from_json(file_path):
+    """Load poses list from a JSON file with keys 'base_rpy' and 'joints'."""
+    with open(file_path, "r") as f:
+        data = json.load(f)
+    poses = data.get("poses", [])
+    if not isinstance(poses, list):
+        raise ValueError("Invalid poses.json format: 'poses' must be a list")
+    return poses
+
+
+def apply_pose(scene: InteractiveScene, pose):
+    """Apply a pose dict: set base orientation from base_rpy and joint targets.
+
+    Pose schema:
+      {
+        "base_rpy": [roll, pitch, yaw],  # radians
+        "joints": { joint_name: value, ... }
+      }
+    """
+    robot = scene["Robot"]
+    device = robot.device
+
+    # Base pose: start from default, keep position, change orientation from RPY
+    root_robot_state = robot.data.default_root_state.clone()
+    root_robot_state[:, :3] += scene.env_origins
+
+    base_rpy = pose.get("base_rpy", [0.0, 0.0, 0.0])
+    if len(base_rpy) != 3:
+        raise ValueError("Pose 'base_rpy' must be a list of length 3")
+    roll, pitch, yaw = float(base_rpy[0]), float(base_rpy[1]), float(base_rpy[2])
+    base_quat = _euler_rpy_to_quat(roll, pitch, yaw, device)
+    root_robot_state[0, 3:7] = base_quat
+
+    # Joints: start from defaults and override provided joints
+    joint_names = robot.data.joint_names
+    joint_positions = robot.data.default_joint_pos.clone()
+    for i, joint_name in enumerate(joint_names):
+        if "joints" in pose and joint_name in pose["joints"]:
+            joint_positions[0, i] = float(pose["joints"][joint_name])
+
+    # Apply to sim
+    robot.write_root_pose_to_sim(root_robot_state[:, :7])
+    robot.write_root_velocity_to_sim(root_robot_state[:, 7:])
+    robot.set_joint_position_target(joint_positions)
+    scene.write_data_to_sim()
+
+
 def compare_joint_orders():
     """Print comparison of different joint ordering systems for debugging."""
     print("\n" + "=" * 100)
@@ -171,13 +236,30 @@ def compare_joint_orders():
 
 def run_debug_visualization(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     """Run the debug visualization with keyboard controls."""
-    
+    # Load poses
+    poses_path = "/home/logan/Projects/g1_crawl/scripts/experiments/poses.json"
+    try:
+        poses = load_poses_from_json(poses_path)
+        if len(poses) == 0:
+            print(f"[WARN] No poses found in {poses_path}. Falling back to debug values.")
+            poses = None
+        else:
+            print(f"[INFO] Loaded {len(poses)} poses from {poses_path}")
+    except Exception as e:
+        print(f"[ERROR] Failed to load poses from {poses_path}: {e}")
+        poses = None
+
     # Print joint information
     get_joint_info(scene)
     compare_joint_orders()
-    
-    # Apply debug joint values
-    apply_debug_joint_values(scene)
+
+    # Apply initial pose or fallback
+    if poses is not None:
+        apply_pose(scene, poses[0])
+        current_pose_idx = 0
+    else:
+        apply_debug_joint_values(scene)
+        current_pose_idx = -1
     
     # Set up keyboard input handling
     input_interface = carb.input.acquire_input_interface()
@@ -187,10 +269,13 @@ def run_debug_visualization(sim: sim_utils.SimulationContext, scene: Interactive
         "R": False,
         "D": False,
         "I": False,
+        "N": False,
+        "P": False,
         "ESCAPE": False,
     }
     
     def on_keyboard_event(event):
+        nonlocal current_pose_idx
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
             if event.input.name == "R" and not keys_pressed["R"]:
                 keys_pressed["R"] = True
@@ -215,6 +300,22 @@ def run_debug_visualization(sim: sim_utils.SimulationContext, scene: Interactive
                 keys_pressed["I"] = True
                 print("\n[DEBUG] Printing joint info...")
                 get_joint_info(scene)
+            elif event.input.name == "N" and not keys_pressed["N"]:
+                keys_pressed["N"] = True
+                if poses is not None and len(poses) > 0:
+                    current_pose_idx = (current_pose_idx + 1) % len(poses)
+                    apply_pose(scene, poses[current_pose_idx])
+                    print(f"[POSE] Applied next pose {current_pose_idx+1}/{len(poses)}")
+                else:
+                    print("[WARN] No poses loaded; cannot switch to next pose.")
+            elif event.input.name == "P" and not keys_pressed["P"]:
+                keys_pressed["P"] = True
+                if poses is not None and len(poses) > 0:
+                    current_pose_idx = (current_pose_idx - 1) % len(poses)
+                    apply_pose(scene, poses[current_pose_idx])
+                    print(f"[POSE] Applied previous pose {current_pose_idx+1}/{len(poses)}")
+                else:
+                    print("[WARN] No poses loaded; cannot switch to previous pose.")
                 
             elif event.input.name == "ESCAPE" and not keys_pressed["ESCAPE"]:
                 keys_pressed["ESCAPE"] = True
@@ -233,6 +334,8 @@ def run_debug_visualization(sim: sim_utils.SimulationContext, scene: Interactive
     print("  R - Reset to default pose")
     print("  D - Apply debug joint values from screenshot")
     print("  I - Print joint information")
+    print("  N - Next pose from poses.json")
+    print("  P - Previous pose from poses.json")
     print("  ESC - Exit")
     print("=" * 80)
     
