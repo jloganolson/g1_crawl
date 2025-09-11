@@ -203,8 +203,11 @@ class CrawlVelocityCommand(CommandTerm):
         base_pos_w = self.robot.data.root_pos_w.clone()
         base_pos_w[:, 2] += 0.5
         # -- resolve the scales and quaternions
-        # goal (still uses base YZ command vector)
-        vel_des_arrow_scale, vel_des_arrow_quat = self._resolve_yz_velocity_to_arrow(self.command[:, :2])
+        # goal: rotate base [0, vy, vz] to world, then align arrow +X via yaw/pitch
+        cmd_xyz_b = torch.zeros((self.num_envs, 3), device=self.device)
+        cmd_xyz_b[:, 1] = self.command[:, 1]
+        cmd_xyz_b[:, 2] = self.command[:, 0]
+        vel_des_arrow_scale, vel_des_arrow_quat = self._resolve_base_velocity_to_arrow_via_world(cmd_xyz_b)
         # current (canonical: rotate base lin vel to world, align +X via yaw/pitch)
         measured_lin_xyz_b = self.robot.data.root_lin_vel_b
         vel_base_alt1_scale, vel_base_alt1_quat = self._resolve_base_velocity_to_arrow_via_world(measured_lin_xyz_b)
@@ -217,11 +220,7 @@ class CrawlVelocityCommand(CommandTerm):
     """
 
     def _resolve_yz_velocity_to_arrow(self, yz_velocity: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Converts the YZ base velocity vector to an arrow orientation in world frame.
-
-        The arrow's local +X axis is first aligned to +Z (pitch -90 deg), then rolled by the
-        angle within the YZ plane such that it points along the YZ velocity direction.
-        """
+        """Deprecated: YZ base-plane arrow. Kept for reference; not used for goal anymore."""
         # obtain default scale of the marker
         default_scale = self.goal_vel_visualizer.cfg.markers["arrow"].scale
         # arrow-scale
