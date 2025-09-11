@@ -63,27 +63,30 @@ def feet_slide(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = Scen
     return reward
 
 
-def track_lin_vel_xy_yaw_frame_exp(
+def track_lin_vel_yz_base_exp(
     env, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
-    """Reward tracking of linear velocity commands (xy axes) in the gravity aligned robot frame using exponential kernel."""
-    # extract the used quantities (to enable type-hinting)
+    """Reward tracking of linear velocity commands in base YZ plane using exponential kernel.
+
+    Compares the commanded [vz, vy] (base frame) to measured base linear velocity [vz, vy].
+    """
     asset = env.scene[asset_cfg.name]
-    vel_yaw = quat_apply_inverse(yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3])
-    lin_vel_error = torch.sum(
-        torch.square(env.command_manager.get_command(command_name)[:, :2] - vel_yaw[:, :2]), dim=1
-    )
-    return torch.exp(-lin_vel_error / std**2)
+    vel_b = asset.data.root_lin_vel_b[:, :3]
+    cmd_yz = env.command_manager.get_command(command_name)[:, :2]  # [vz, vy]
+    meas_yz = vel_b[:, [2, 1]]  # [vz, vy]
+    lin_vel_error = torch.sum(torch.square(cmd_yz - meas_yz), dim=1)
+    return torch.exp(-lin_vel_error / (std ** 2))
 
 
-def track_ang_vel_z_world_exp(
+def track_ang_vel_x_world_exp(
     env, command_name: str, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
-    """Reward tracking of angular velocity commands (yaw) in world frame using exponential kernel."""
-    # extract the used quantities (to enable type-hinting)
+    """Reward tracking of roll angular velocity command (ωx) in world frame using exponential kernel."""
     asset = env.scene[asset_cfg.name]
-    ang_vel_error = torch.square(env.command_manager.get_command(command_name)[:, 2] - asset.data.root_ang_vel_w[:, 2])
-    return torch.exp(-ang_vel_error / std**2)
+    ang_vel_error = torch.square(
+        env.command_manager.get_command(command_name)[:, 2] - asset.data.root_ang_vel_w[:, 0]
+    )
+    return torch.exp(-ang_vel_error / (std ** 2))
 
 
 def both_feet_air(env, sensor_cfg: SceneEntityCfg) -> torch.Tensor:

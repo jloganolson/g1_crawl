@@ -34,19 +34,16 @@ from isaaclab.utils import configclass
 class CrawlVelocityCommand(CommandTerm):
     r"""Command generator that generates a velocity command in SE(2) from uniform distribution.
 
-    The command comprises of a linear velocity in x and y direction and an angular velocity around
-    the z-axis. It is given in the robot's base frame.
+    The command comprises of a linear velocity in z and y direction and an angular velocity around
+    the x-axis (roll). It is given in the robot's base frame.
 
     If the :attr:`cfg.heading_command` flag is set to True, the angular velocity is computed from the heading
     error similar to doing a proportional control on the heading error. The target heading is sampled uniformly
     from the provided range. Otherwise, the angular velocity is sampled uniformly from the provided range.
 
-    Mathematically, the angular velocity is computed as follows from the heading command:
-
-    .. math::
-
-        \omega_z = \frac{1}{2} \text{wrap_to_pi}(\theta_{\text{target}} - \theta_{\text{current}})
-
+    Note: When :attr:`cfg.heading_command` is True, the current implementation still computes the error
+    using the robot's heading around z (yaw) to remain backward compatible. Set ``heading_command=False``
+    to use purely sampled roll rates, or adapt this path to roll targets as needed.
     """
 
     cfg: CrawlVelocityCommandCfg
@@ -82,14 +79,14 @@ class CrawlVelocityCommand(CommandTerm):
         self.robot: Articulation = env.scene[cfg.asset_name]
 
         # crete buffers to store the command
-        # -- command: x vel, y vel, yaw vel, heading
+        # -- command: z vel, y vel, roll vel, heading
         self.vel_command_b = torch.zeros(self.num_envs, 3, device=self.device)
         self.heading_target = torch.zeros(self.num_envs, device=self.device)
         self.is_heading_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.is_standing_env = torch.zeros_like(self.is_heading_env)
         # -- metrics
-        self.metrics["error_vel_xy"] = torch.zeros(self.num_envs, device=self.device)
-        self.metrics["error_vel_yaw"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_vel_yz"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_vel_roll"] = torch.zeros(self.num_envs, device=self.device)
 
     def __str__(self) -> str:
         """Return a string representation of the command generator."""
@@ -120,22 +117,27 @@ class CrawlVelocityCommand(CommandTerm):
         max_command_time = self.cfg.resampling_time_range[1]
         max_command_step = max_command_time / self._env.step_dt
         # logs data
-        self.metrics["error_vel_xy"] += (
-            torch.norm(self.vel_command_b[:, :2] - self.robot.data.root_lin_vel_b[:, :2], dim=-1) / max_command_step
-        )
-        self.metrics["error_vel_yaw"] += (
-            torch.abs(self.vel_command_b[:, 2] - self.robot.data.root_ang_vel_b[:, 2]) / max_command_step
-        )
+        # Linear velocity tracking in base YZ plane: command [vz, vy] vs measured [vz, vy]
+        measured_lin_yz = self.robot.data.root_lin_vel_b[:, [2, 1]]
+        lin_err = torch.norm(self.vel_command_b[:, :2] - measured_lin_yz, dim=-1) / max_command_step
+        self.metrics["error_vel_yz"] += lin_err
+        # Angular velocity tracking around base X (roll)
+        ang_err = torch.abs(self.vel_command_b[:, 2] - self.robot.data.root_ang_vel_b[:, 0]) / max_command_step
+        self.metrics["error_vel_roll"] += ang_err
 
     def _resample_command(self, env_ids: Sequence[int]):
         # sample velocity commands
         r = torch.empty(len(env_ids), device=self.device)
-        # -- linear velocity - x direction
-        self.vel_command_b[env_ids, 0] = r.uniform_(*self.cfg.ranges.lin_vel_x)
-        # -- linear velocity - y direction
-        self.vel_command_b[env_ids, 1] = r.uniform_(*self.cfg.ranges.lin_vel_y)
-        # -- ang vel yaw - rotation around z
-        self.vel_command_b[env_ids, 2] = r.uniform_(*self.cfg.ranges.ang_vel_z)
+        ranges = self.cfg.ranges
+        lin_vel_z_range = ranges.lin_vel_z
+        lin_vel_y_range = ranges.lin_vel_y
+        ang_vel_x_range = ranges.ang_vel_x
+        # -- linear velocity - z direction (index 0)
+        self.vel_command_b[env_ids, 0] = r.uniform_(*lin_vel_z_range)
+        # -- linear velocity - y direction (index 1)
+        self.vel_command_b[env_ids, 1] = r.uniform_(*lin_vel_y_range)
+        # -- angular velocity roll around x (index 2)
+        self.vel_command_b[env_ids, 2] = r.uniform_(*ang_vel_x_range)
         # heading target
         if self.cfg.heading_command:
             self.heading_target[env_ids] = r.uniform_(*self.cfg.ranges.heading)
@@ -154,12 +156,15 @@ class CrawlVelocityCommand(CommandTerm):
         if self.cfg.heading_command:
             # resolve indices of heading envs
             env_ids = self.is_heading_env.nonzero(as_tuple=False).flatten()
-            # compute angular velocity
+            # compute angular velocity from heading error (backward compatible: yaw-based)
             heading_error = math_utils.wrap_to_pi(self.heading_target[env_ids] - self.robot.data.heading_w[env_ids])
+            # clamp using roll range
+            ranges = self.cfg.ranges
+            ang_vel_x_range = ranges.ang_vel_x
             self.vel_command_b[env_ids, 2] = torch.clip(
                 self.cfg.heading_control_stiffness * heading_error,
-                min=self.cfg.ranges.ang_vel_z[0],
-                max=self.cfg.ranges.ang_vel_z[1],
+                min=ang_vel_x_range[0],
+                max=ang_vel_x_range[1],
             )
         # Enforce standing (i.e., zero velocity command) for standing envs
         # TODO: check if conversion is needed
@@ -193,9 +198,10 @@ class CrawlVelocityCommand(CommandTerm):
         # -- base state
         base_pos_w = self.robot.data.root_pos_w.clone()
         base_pos_w[:, 2] += 0.5
-        # -- resolve the scales and quaternions
-        vel_des_arrow_scale, vel_des_arrow_quat = self._resolve_xy_velocity_to_arrow(self.command[:, :2])
-        vel_arrow_scale, vel_arrow_quat = self._resolve_xy_velocity_to_arrow(self.robot.data.root_lin_vel_b[:, :2])
+        # -- resolve the scales and quaternions (use YZ plane)
+        vel_des_arrow_scale, vel_des_arrow_quat = self._resolve_yz_velocity_to_arrow(self.command[:, :2])
+        measured_lin_yz = self.robot.data.root_lin_vel_b[:, [2, 1]]
+        vel_arrow_scale, vel_arrow_quat = self._resolve_yz_velocity_to_arrow(measured_lin_yz)
         # display markers
         self.goal_vel_visualizer.visualize(base_pos_w, vel_des_arrow_quat, vel_des_arrow_scale)
         self.current_vel_visualizer.visualize(base_pos_w, vel_arrow_quat, vel_arrow_scale)
@@ -204,17 +210,25 @@ class CrawlVelocityCommand(CommandTerm):
     Internal helpers.
     """
 
-    def _resolve_xy_velocity_to_arrow(self, xy_velocity: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Converts the XY base velocity command to arrow direction rotation."""
+    def _resolve_yz_velocity_to_arrow(self, yz_velocity: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Converts the YZ base velocity vector to an arrow orientation in world frame.
+
+        The arrow's local +X axis is first aligned to +Z (pitch -90 deg), then rolled by the
+        angle within the YZ plane such that it points along the YZ velocity direction.
+        """
         # obtain default scale of the marker
         default_scale = self.goal_vel_visualizer.cfg.markers["arrow"].scale
         # arrow-scale
-        arrow_scale = torch.tensor(default_scale, device=self.device).repeat(xy_velocity.shape[0], 1)
-        arrow_scale[:, 0] *= torch.linalg.norm(xy_velocity, dim=1) * 3.0
+        arrow_scale = torch.tensor(default_scale, device=self.device).repeat(yz_velocity.shape[0], 1)
+        arrow_scale[:, 0] *= torch.linalg.norm(yz_velocity, dim=1) * 3.0
         # arrow-direction
-        heading_angle = torch.atan2(xy_velocity[:, 1], xy_velocity[:, 0])
-        zeros = torch.zeros_like(heading_angle)
-        arrow_quat = math_utils.quat_from_euler_xyz(zeros, zeros, heading_angle)
+        phi = torch.atan2(yz_velocity[:, 1], yz_velocity[:, 0])  # atan2(vy, vz) with ordering [vz, vy]
+        zeros = torch.zeros_like(phi)
+        pitch_neg_90 = torch.full_like(phi, -math.pi / 2.0)
+        align_x_to_z = math_utils.quat_from_euler_xyz(zeros, pitch_neg_90, zeros)
+        roll_by_phi = math_utils.quat_from_euler_xyz(phi, zeros, zeros)
+        # Apply alignment first, then roll around the aligned X axis: arrow = roll ⊗ align
+        arrow_quat = math_utils.quat_mul(roll_by_phi, align_x_to_z)
         # convert everything back from base to world frame
         base_quat_w = self.robot.data.root_quat_w
         arrow_quat = math_utils.quat_mul(base_quat_w, arrow_quat)
@@ -255,16 +269,16 @@ class CrawlVelocityCommandCfg(CommandTermCfg):
 
     @configclass
     class Ranges:
-        """Uniform distribution ranges for the velocity commands."""
+        """Uniform distribution ranges for the velocity commands in base YZ plane with roll about X."""
 
-        lin_vel_x: tuple[float, float] = MISSING
-        """Range for the linear-x velocity command (in m/s)."""
+        lin_vel_z: tuple[float, float] = MISSING
+        """Range for the linear-z velocity command (in m/s)."""
 
         lin_vel_y: tuple[float, float] = MISSING
         """Range for the linear-y velocity command (in m/s)."""
 
-        ang_vel_z: tuple[float, float] = MISSING
-        """Range for the angular-z velocity command (in rad/s)."""
+        ang_vel_x: tuple[float, float] = MISSING
+        """Range for the angular-x (roll) velocity command (in rad/s)."""
 
         heading: tuple[float, float] | None = None
         """Range for the heading command (in rad). Defaults to None.

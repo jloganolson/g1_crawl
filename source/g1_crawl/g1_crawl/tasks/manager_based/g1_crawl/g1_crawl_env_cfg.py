@@ -91,11 +91,11 @@ class CommandsCfg:
         heading_control_stiffness=0.5,
         debug_vis=True,
         ranges=mdp.CrawlVelocityCommandCfg.Ranges(
-            lin_vel_x=(-1.0, 1.0), 
-            lin_vel_y=(0.0,0.0), 
-            # lin_vel_y=(-1.0, 1.0), 
-            ang_vel_z=(-1.0, 1.0), 
-            heading=(0.0,0.0)
+            heading=(0.0,0.0),
+            # Crawling fields used by the command implementation
+            lin_vel_z=(-1.0, 1.0),
+            lin_vel_y=(-1.0, 1.0),
+            ang_vel_x=(-1.0, 1.0)
         )
     )
 
@@ -282,14 +282,14 @@ class RewardsCfg:
     # lin_vel_l2 = RewTerm(func=mdp.lin_vel_l2, weight=-5.0)
     # ang_vel_l2 = RewTerm(func=mdp.ang_vel_l2, weight=-5.0)
 
-    #follow commands
-    track_lin_vel_xy_exp = RewTerm(
-        func=mdp.track_lin_vel_xy_yaw_frame_exp,
+    #follow commands (base YZ plane and roll about X)
+    track_lin_vel_yz_exp = RewTerm(
+        func=mdp.track_lin_vel_yz_base_exp,
         weight=1.0,
         params={"command_name": "base_velocity", "std": 0.5},
     )
-    track_ang_vel_z_exp = RewTerm(
-        func=mdp.track_ang_vel_z_world_exp, weight=1.0, params={"command_name": "base_velocity", "std": 0.5}
+    track_ang_vel_x_exp = RewTerm(
+        func=mdp.track_ang_vel_x_world_exp, weight=1.0, params={"command_name": "base_velocity", "std": 0.5}
     )
     flat_orientation_l2 = RewTerm(func=mdp.align_projected_gravity_plus_x_l2, weight=.1)
     
@@ -437,9 +437,10 @@ class G1CrawlEnvCfg(ManagerBasedRLEnvCfg):
         # )
 
         # Commands
-        self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (-1.0, 1.0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        # Crawling fields
+        # self.commands.base_velocity.ranges.lin_vel_z = (-1.0, 1.0)
+        # self.commands.base_velocity.ranges.lin_vel_y = (-1.0, 1.0)
+        # self.commands.base_velocity.ranges.ang_vel_x = (-1.0, 1.0)
 
         # terminations
         # self.terminations.base_contact.params["sensor_cfg"].body_names = "torso_link"
