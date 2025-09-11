@@ -11,7 +11,7 @@ from .symmetry_func import data_augmentation_func_g1
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    max_iterations = 2500
+    max_iterations = 1500 #2500
     save_interval = 500
     experiment_name = "crawl_helloworld"
     empirical_normalization = False

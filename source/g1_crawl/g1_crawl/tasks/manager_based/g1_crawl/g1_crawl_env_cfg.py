@@ -82,28 +82,44 @@ class G1CrawlSceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     """Command specifications for the MDP."""
 
-    base_velocity = mdp.UniformVelocityCommandCfg(
+    base_velocity = mdp.CrawlVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.02,
+        rel_standing_envs=0.1,
         rel_heading_envs=1.0,
         heading_command=False,
         heading_control_stiffness=0.5,
-        debug_vis=False,
-        ranges=mdp.UniformVelocityCommandCfg.Ranges(
+        debug_vis=True,
+        ranges=mdp.CrawlVelocityCommandCfg.Ranges(
             lin_vel_x=(-1.0, 1.0), 
-            lin_vel_y=(-1.0, 1.0), 
+            lin_vel_y=(0.0,0.0), 
+            # lin_vel_y=(-1.0, 1.0), 
             ang_vel_z=(-1.0, 1.0), 
-            # heading=(-math.pi, math.pi)
-        ),
+            heading=(0.0,0.0)
+        )
     )
+
+
+    # base_velocity = mdp.UniformVelocityCommandCfg(
+    #     asset_name="robot",
+    #     resampling_time_range=(10.0, 10.0),
+    #     rel_standing_envs=0.02,
+    #     rel_heading_envs=1.0,
+    #     heading_command=True,
+    #     heading_control_stiffness=0.5,
+    #     debug_vis=True,
+    #     ranges=mdp.UniformVelocityCommandCfg.Ranges(
+    #         lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
+    #     ),
+    # )
+
 
 
 @configclass
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.0, use_default_offset=True)
+    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.5, use_default_offset=True)
 
 
 @configclass
@@ -262,17 +278,23 @@ class RewardsCfg:
     """Reward terms for the MDP."""
 
 
-    # feet_on_ground = RewTerm(
-    #     func=mdp.both_feet_on_ground, 
-    #     weight=10.0,       
-    #     params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
-    # )
-    lin_vel_l2 = RewTerm(func=mdp.lin_vel_l2, weight=-5.0)
-    ang_vel_l2 = RewTerm(func=mdp.ang_vel_l2, weight=-5.0)
+    #hold still
+    # lin_vel_l2 = RewTerm(func=mdp.lin_vel_l2, weight=-5.0)
+    # ang_vel_l2 = RewTerm(func=mdp.ang_vel_l2, weight=-5.0)
 
+    #follow commands
+    track_lin_vel_xy_exp = RewTerm(
+        func=mdp.track_lin_vel_xy_yaw_frame_exp,
+        weight=1.0,
+        params={"command_name": "base_velocity", "std": 0.5},
+    )
+    track_ang_vel_z_exp = RewTerm(
+        func=mdp.track_ang_vel_z_world_exp, weight=1.0, params={"command_name": "base_velocity", "std": 0.5}
+    )
     flat_orientation_l2 = RewTerm(func=mdp.align_projected_gravity_plus_x_l2, weight=.1)
     
-    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
+    
+    # termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
     
     
     base_height_l2 = RewTerm(
@@ -289,7 +311,7 @@ class RewardsCfg:
         weight=-0.1,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
-
+    
     #limits
     dof_pos_limits = RewTerm(
         func=mdp.joint_pos_limits,
@@ -305,14 +327,36 @@ class RewardsCfg:
     #regulatorization
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-2)
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-4)
-    # slippage = RewTerm(
-    #     func=mdp.feet_slide, 
-    #     weight=-.01,
-    #             params={
-    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
-    #         "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
-    #     },
-    # )
+
+    bellyhead_drag_penalty = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-5.0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names= "torso_link",
+            ),
+            "threshold": 1.0,  # in Newtons (normal force magnitude)
+        },
+    )
+    slippage = RewTerm(
+        func=mdp.feet_slide, 
+        weight=-.01,
+                params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
+            "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
+        },
+    )
+
+    feet_air_time = RewTerm(
+        func=mdp.feet_air_time,
+        weight=0.125,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
+            "command_name": "base_velocity",
+            "threshold": 0.5,
+        },
+    )
 
 
 @configclass
@@ -320,10 +364,10 @@ class TerminationsCfg:
     """Termination terms for the MDP."""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    base_contact = DoneTerm(
-        func=mdp.illegal_contact,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
-    )
+    # base_contact = DoneTerm(
+    #     func=mdp.illegal_contact,
+    #     params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
+    # )
 
 @configclass
 class CurriculumCfg:
@@ -398,4 +442,4 @@ class G1CrawlEnvCfg(ManagerBasedRLEnvCfg):
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
 
         # terminations
-        self.terminations.base_contact.params["sensor_cfg"].body_names = "torso_link"
+        # self.terminations.base_contact.params["sensor_cfg"].body_names = "torso_link"
