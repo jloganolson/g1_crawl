@@ -179,15 +179,19 @@ class CrawlVelocityCommand(CommandTerm):
             if not hasattr(self, "goal_vel_visualizer"):
                 # -- goal
                 self.goal_vel_visualizer = VisualizationMarkers(self.cfg.goal_vel_visualizer_cfg)
-                # -- current
-                self.current_vel_visualizer = VisualizationMarkers(self.cfg.current_vel_visualizer_cfg)
+                # -- current (base alt1 - canonical)
+                self.current_vel_base_alt1_visualizer = VisualizationMarkers(self.cfg.current_vel_base_alt1_visualizer_cfg)
+            else:
+                if not hasattr(self, "current_vel_base_alt1_visualizer"):
+                    self.current_vel_base_alt1_visualizer = VisualizationMarkers(self.cfg.current_vel_base_alt1_visualizer_cfg)
             # set their visibility to true
             self.goal_vel_visualizer.set_visibility(True)
-            self.current_vel_visualizer.set_visibility(True)
+            self.current_vel_base_alt1_visualizer.set_visibility(True)
         else:
             if hasattr(self, "goal_vel_visualizer"):
                 self.goal_vel_visualizer.set_visibility(False)
-                self.current_vel_visualizer.set_visibility(False)
+                if hasattr(self, "current_vel_base_alt1_visualizer"):
+                    self.current_vel_base_alt1_visualizer.set_visibility(False)
 
     def _debug_vis_callback(self, event):
         # check if robot is initialized
@@ -198,13 +202,15 @@ class CrawlVelocityCommand(CommandTerm):
         # -- base state
         base_pos_w = self.robot.data.root_pos_w.clone()
         base_pos_w[:, 2] += 0.5
-        # -- resolve the scales and quaternions (use YZ plane)
+        # -- resolve the scales and quaternions
+        # goal (still uses base YZ command vector)
         vel_des_arrow_scale, vel_des_arrow_quat = self._resolve_yz_velocity_to_arrow(self.command[:, :2])
-        measured_lin_yz = self.robot.data.root_lin_vel_b[:, [2, 1]]
-        vel_arrow_scale, vel_arrow_quat = self._resolve_yz_velocity_to_arrow(measured_lin_yz)
+        # current (canonical: rotate base lin vel to world, align +X via yaw/pitch)
+        measured_lin_xyz_b = self.robot.data.root_lin_vel_b
+        vel_base_alt1_scale, vel_base_alt1_quat = self._resolve_base_velocity_to_arrow_via_world(measured_lin_xyz_b)
         # display markers
         self.goal_vel_visualizer.visualize(base_pos_w, vel_des_arrow_quat, vel_des_arrow_scale)
-        self.current_vel_visualizer.visualize(base_pos_w, vel_arrow_quat, vel_arrow_scale)
+        self.current_vel_base_alt1_visualizer.visualize(base_pos_w, vel_base_alt1_quat, vel_base_alt1_scale)
 
     """
     Internal helpers.
@@ -233,6 +239,29 @@ class CrawlVelocityCommand(CommandTerm):
         base_quat_w = self.robot.data.root_quat_w
         arrow_quat = math_utils.quat_mul(base_quat_w, arrow_quat)
 
+        return arrow_scale, arrow_quat
+
+    def _resolve_base_velocity_to_arrow_via_world(self, xyz_velocity_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Converts the base XYZ velocity to world, then aligns arrow +X to it (yaw/pitch).
+
+        This should match the world-frame visualization if frame transforms are consistent.
+        """
+        # scale by 3D norm of base velocity
+        default_scale = self.current_vel_base_alt1_visualizer.cfg.markers["arrow"].scale
+        arrow_scale = torch.tensor(default_scale, device=self.device).repeat(xyz_velocity_b.shape[0], 1)
+        arrow_scale[:, 0] *= torch.linalg.norm(xyz_velocity_b, dim=1) * 3.0
+        # rotate base velocity into world frame
+        base_quat_w = self.robot.data.root_quat_w
+        vel_w = math_utils.quat_rotate(base_quat_w, xyz_velocity_b)
+        # orient arrow like world method
+        vx = vel_w[:, 0]
+        vy = vel_w[:, 1]
+        vz = vel_w[:, 2]
+        yaw = torch.atan2(vy, vx)
+        horiz = torch.sqrt(vx * vx + vy * vy)
+        pitch = torch.atan2(-vz, horiz)
+        zeros = torch.zeros_like(yaw)
+        arrow_quat = math_utils.quat_from_euler_xyz(zeros, pitch, yaw)
         return arrow_scale, arrow_quat
 
 
@@ -294,12 +323,17 @@ class CrawlVelocityCommandCfg(CommandTermCfg):
     )
     """The configuration for the goal velocity visualization marker. Defaults to GREEN_ARROW_X_MARKER_CFG."""
 
-    current_vel_visualizer_cfg: VisualizationMarkersCfg = BLUE_ARROW_X_MARKER_CFG.replace(
-        prim_path="/Visuals/Command/velocity_current"
+    current_vel_base_alt1_visualizer_cfg: VisualizationMarkersCfg = GREEN_ARROW_X_MARKER_CFG.replace(
+        prim_path="/Visuals/Command/velocity_current_base_alt1"
     )
-    """The configuration for the current velocity visualization marker. Defaults to BLUE_ARROW_X_MARKER_CFG."""
+    """Alternative base-frame visualization: rotate base velocity into world, yaw/pitch align."""
 
     # Set the scale of the visualization markers to (0.5, 0.5, 0.5)
     goal_vel_visualizer_cfg.markers["arrow"].scale = (0.5, 0.5, 0.5)
-    current_vel_visualizer_cfg.markers["arrow"].scale = (0.5, 0.5, 0.5)
+    current_vel_base_alt1_visualizer_cfg.markers["arrow"].scale = (0.5, 0.5, 0.5)
+
+    # Unique colors per visualizer for clarity
+    # goal: green (from GREEN_ARROW_X_MARKER_CFG)
+    current_vel_base_alt1_visualizer_cfg.markers["arrow"].color = (1.0, 0.6, 0.1)
+    
 
