@@ -246,6 +246,24 @@ class EventCfg:
     # )
 
     # interval
+    viz_anim_sites = EventTerm(
+        func=mdp.viz_animation_sites_step,
+        mode="interval",
+        interval_range_s=(0.0,0.0),
+        params={
+            "max_envs": 32,
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+    viz_base_step = EventTerm(
+        func=mdp.viz_base_positions_step,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        params={
+            "max_envs": 32,
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
     # push_robot = EventTerm(
     #     func=mdp.push_by_setting_velocity_with_viz,
     #     mode="interval",
