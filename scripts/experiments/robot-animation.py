@@ -236,6 +236,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     anim = load_animation_json(scene["Robot"].device)
 
     sim_dt = sim.get_physics_dt()
+    print(f"Simulation dt: {sim_dt:.4f}s")
     sim_time = 0.0
 
     # Build joint index map

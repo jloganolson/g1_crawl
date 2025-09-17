@@ -50,7 +50,7 @@ class G1CrawlSceneCfg(InteractiveSceneCfg):
             dynamic_friction=1.0,
         ),
         visual_material=sim_utils.MdlFileCfg(
-            mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
+            mdl_path=f"{ISAAC_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
             project_uvw=True,
             texture_scale=(0.25, 0.25),
         ),
@@ -228,40 +228,22 @@ class EventCfg:
         },
     )
     # reset
-    # base_external_force_torque = EventTerm(
-    #     func=mdp.apply_external_force_torque,
+    # Replace uniform base reset with animation-based reset
+    reset_base = EventTerm(
+        func=mdp.reset_from_animation,
+        mode="reset",
+        params={},
+    )
+
+    # Disable default joint reset since animation sets joints explicitly
+    # reset_robot_joints = EventTerm(
+    #     func=mdp.reset_joints_by_scale,
     #     mode="reset",
     #     params={
-    #         "asset_cfg": SceneEntityCfg("robot", body_names="base"),
-    #         "force_range": (0.0, 0.0),
-    #         "torque_range": (-0.0, 0.0),
+    #         "position_range": (1.0, 1.0),
+    #         "velocity_range": (0.0, 0.0),
     #     },
     # )
-
-    reset_base = EventTerm(
-        func=mdp.reset_root_state_uniform,
-        mode="reset",
-        params={
-            "pose_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)},
-            "velocity_range": {
-                "x": (0.0, 0.0),
-                "y": (0.0, 0.0),
-                "z": (0.0, 0.0),
-                "roll": (0.0, 0.0),
-                "pitch": (0.0, 0.0),
-                "yaw": (0.0, 0.0),
-            }
-        },
-    )
-
-    reset_robot_joints = EventTerm(
-        func=mdp.reset_joints_by_scale,
-        mode="reset",
-        params={
-            "position_range": (1.0, 1.0),
-            "velocity_range": (0.0, 0.0),
-        },
-    )
 
     # interval
     # push_robot = EventTerm(

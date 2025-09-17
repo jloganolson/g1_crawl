@@ -251,7 +251,7 @@ class CrawlVelocityCommand(CommandTerm):
         arrow_scale[:, 0] *= torch.linalg.norm(xyz_velocity_b, dim=1) * 3.0
         # rotate base velocity into world frame
         base_quat_w = self.robot.data.root_quat_w
-        vel_w = math_utils.quat_rotate(base_quat_w, xyz_velocity_b)
+        vel_w = math_utils.quat_apply(base_quat_w, xyz_velocity_b)
         # orient arrow like world method
         vx = vel_w[:, 0]
         vy = vel_w[:, 1]

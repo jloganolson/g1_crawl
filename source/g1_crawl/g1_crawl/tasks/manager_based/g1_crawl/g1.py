@@ -1,6 +1,9 @@
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
+import torch
+import os
+import json
 
 # taken from https://github.com/HybridRobotics/whole_body_tracking/blob/dcecabd8c24c68f59d143fdf8e3a670f420c972d/source/whole_body_tracking/whole_body_tracking/robots/g1.py
 ARMATURE_5020 = 0.003609725
@@ -179,3 +182,101 @@ G1_CFG = ArticulationCfg(
         ),
     },
 )
+
+
+def _default_animation_path() -> str:
+    # return "assets/animation_rc0.json"
+    # """Return the default animation JSON path.
+
+    # Priority:
+    # 1) Environment variable `G1_ANIMATION_JSON`
+    # 2) Repository path: scripts/experiments/animation_20250915_134944.json
+    # """
+    # env_path = os.environ.get("G1_ANIMATION_JSON", None)
+    # if env_path and os.path.exists(env_path):
+    #     return env_path
+
+    # # Compute repo root from this file
+    this_dir = os.path.dirname(__file__)
+    repo_root = os.path.abspath(os.path.join(this_dir, "../../../../../../"))
+    # candidate = os.path.join(repo_root, "scripts/experiments/animation_20250915_134944.json")
+    candidate = os.path.join(repo_root, "assets/animation_rc0.json")
+
+    return candidate
+
+
+def load_animation_json(json_path: str | None = None) -> dict:
+    """Load animation JSON containing qpos frames and metadata.
+
+    Returns dict with keys:
+    - dt: float
+    - nq: int
+    - qpos: torch.FloatTensor [T, nq] (CPU tensor)
+    - qpos_labels: list[str] | None
+    - metadata: dict
+    - base_meta: dict | None (with pos_indices, quat_indices)
+    - joints_meta: list|dict mapping joint names to qpos indices
+    - num_frames: int
+    - json_path: str
+    """
+    path = json_path or _default_animation_path()
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Animation JSON not found: {path}")
+
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    if "dt" in data:
+        dt = float(data["dt"])
+    elif "fps" in data and data["fps"]:
+        dt = 1.0 / float(data["fps"])
+    else:
+        dt = 1.0 / 30.0
+
+    nq = int(data.get("nq", 0)) or None
+
+    if "qpos" in data:
+        qpos_list = data["qpos"]
+    elif "frames" in data:
+        qpos_list = data["frames"]
+    elif "positions" in data:
+        qpos_list = data["positions"]
+    else:
+        raise KeyError("Animation JSON missing 'qpos' (or 'frames'/'positions') array")
+
+    T = len(qpos_list)
+    qpos_tensor = torch.tensor(qpos_list, dtype=torch.float32, device="cpu")
+    if nq is not None and qpos_tensor.shape[1] != nq:
+        nq = qpos_tensor.shape[1]
+    elif nq is None:
+        nq = qpos_tensor.shape[1]
+
+    metadata = data.get("metadata", {}) or {}
+    qpos_labels = data.get("qpos_labels", None) or metadata.get("qpos_labels", None)
+    base_meta = metadata.get("base", None)
+    joints_meta = metadata.get("joints", {}) or {}
+
+    # Normalize base world x/y so the animation starts at the origin.
+    # If base position indices are provided, subtract the first frame's x/y from all frames.
+    if base_meta is not None:
+        pos_idx = base_meta.get("pos_indices", None)
+        if isinstance(pos_idx, (list, tuple)) and len(pos_idx) >= 2:
+            x_idx = int(pos_idx[0])
+            y_idx = int(pos_idx[1])
+            x0 = float(qpos_tensor[0, x_idx].item())
+            y0 = float(qpos_tensor[0, y_idx].item())
+            if x0 != 0.0 or y0 != 0.0:
+                qpos_tensor[:, x_idx] -= x0
+                qpos_tensor[:, y_idx] -= y0
+
+    return {
+        "dt": float(dt),
+        "nq": int(nq),
+        "qpos": qpos_tensor,
+        "qpos_labels": qpos_labels,
+        "metadata": metadata,
+        "base_meta": base_meta,
+        "joints_meta": joints_meta,
+        "num_frames": int(T),
+        "json_path": path,
+    }

@@ -269,3 +269,187 @@ def my_event_with_viz(env, env_ids, params, asset_cfg):
 Note: Visualization automatically detects headless mode and gracefully skips drawing
 to prevent import errors during training.
 """
+
+def reset_root_state_to_pose(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    pose_range: dict[str, tuple[float, float]],
+    velocity_range: dict[str, tuple[float, float]],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Reset the asset root state to a random position and velocity uniformly within the given ranges.
+
+    This function randomizes the root position and velocity of the asset.
+
+    * It samples the root position from the given ranges and adds them to the default root position, before setting
+      them into the physics simulation.
+    * It samples the root orientation from the given ranges and sets them into the physics simulation.
+    * It samples the root velocity from the given ranges and sets them into the physics simulation.
+
+    The function takes a dictionary of pose and velocity ranges for each axis and rotation. The keys of the
+    dictionary are ``x``, ``y``, ``z``, ``roll``, ``pitch``, and ``yaw``. The values are tuples of the form
+    ``(min, max)``. If the dictionary does not contain a key, the position or velocity is set to zero for that axis.
+    """
+    # extract the used quantities (to enable type-hinting)
+    asset: RigidObject | Articulation = env.scene[asset_cfg.name]
+    # get default root state
+    root_states = asset.data.default_root_state[env_ids].clone()
+
+    # poses
+    range_list = [pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
+    ranges = torch.tensor(range_list, device=asset.device)
+    rand_samples = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=asset.device)
+
+    positions = root_states[:, 0:3] + env.scene.env_origins[env_ids] + rand_samples[:, 0:3]
+    orientations_delta = math_utils.quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
+    orientations = math_utils.quat_mul(root_states[:, 3:7], orientations_delta)
+    # velocities
+    range_list = [velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
+    ranges = torch.tensor(range_list, device=asset.device)
+    rand_samples = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=asset.device)
+
+    velocities = root_states[:, 7:13] + rand_samples
+
+    # set into the physics simulation
+    asset.write_root_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
+    asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
+
+
+# ===== Animation-based reset helpers and event =====
+from ..g1 import load_animation_json
+
+_ANIM_CACHE: dict | None = None
+
+
+def _get_animation(json_path: str | None = None) -> dict:
+    global _ANIM_CACHE
+    if _ANIM_CACHE is None:
+        _ANIM_CACHE = load_animation_json(json_path)
+    return _ANIM_CACHE
+
+
+def _build_joint_index_map(asset: Articulation, joints_meta, qpos_labels):
+    robot_joint_names = asset.data.joint_names
+    index_map: list[int] = []
+    missing: list[str] = []
+
+    name_to_qposadr: dict[str, int] = {}
+    if isinstance(joints_meta, dict):
+        for name, qposadr in joints_meta.items():
+            try:
+                name_to_qposadr[str(name)] = int(qposadr)
+            except Exception:
+                continue
+    elif isinstance(joints_meta, list):
+        for item in joints_meta:
+            if not isinstance(item, dict):
+                continue
+            jname = item.get("name")
+            jtype = item.get("type")
+            adr = item.get("qposadr")
+            dim = item.get("qposdim", 1)
+            if jname is not None and jtype in ("hinge", "slide") and isinstance(adr, int) and int(dim) == 1:
+                name_to_qposadr[str(jname)] = int(adr)
+
+    label_lookup: dict[str, int] = {}
+    if qpos_labels is not None:
+        for i, lbl in enumerate(qpos_labels):
+            s = str(lbl)
+            label_lookup[s] = i
+            if s.startswith("joint:"):
+                label_lookup[s[len("joint:"):]] = i
+
+    for jn in robot_joint_names:
+        qidx = -1
+        if jn in name_to_qposadr:
+            qidx = name_to_qposadr[jn]
+        else:
+            if jn in label_lookup:
+                qidx = label_lookup[jn]
+            elif ("joint:" + jn) in label_lookup:
+                qidx = label_lookup["joint:" + jn]
+        index_map.append(qidx)
+        if qidx == -1:
+            missing.append(jn)
+
+    if missing:
+        print(f"[WARN] Missing qpos indices for {len(missing)} joints (will keep defaults)")
+    return index_map
+
+
+def reset_from_animation(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    json_path: str | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Reset root pose and joint positions from a random frame of an animation JSON.
+
+    - Loads animation JSON once and caches it.
+    - Picks a random frame per environment.
+    - If base metadata present, sets base pos/quat. Otherwise keeps defaults.
+    - Sets 1-DOF joint positions based on mapping. Unmapped joints keep defaults.
+    - Sets all velocities to zero.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    device = asset.device
+
+    anim = _get_animation(json_path)
+
+    # Build joint index map once per call (cheap) — could be cached by joint_names hash if needed
+    joint_index_map = _build_joint_index_map(asset, anim.get("joints_meta"), anim.get("qpos_labels"))
+
+    num_envs = len(env_ids)
+    num_robot_dofs = asset.data.default_joint_pos.shape[1]
+
+    # Choose random frames per env
+    T = int(anim["num_frames"])
+    frame_indices = torch.randint(low=0, high=T, size=(num_envs,), device="cpu")
+
+    # Prepare root states
+    root_state = asset.data.default_root_state[env_ids].clone()
+    base_meta = anim.get("base_meta")
+    if base_meta is not None:
+        pos_idx = base_meta.get("pos_indices", None)
+        quat_idx = base_meta.get("quat_indices", None)
+    else:
+        pos_idx, quat_idx = None, None
+
+    # env origins
+    env_origins = env.scene.env_origins[env_ids].to(device=device)
+
+    # Apply base pose from animation if available
+    if pos_idx is not None and quat_idx is not None:
+        # Gather per-env base pose from selected frames
+        qpos = anim["qpos"]  # CPU tensor [T, nq]
+        base_pos = torch.stack([qpos[int(fi), pos_idx] for fi in frame_indices], dim=0).to(device=device)
+        wxyz = torch.stack([qpos[int(fi), quat_idx] for fi in frame_indices], dim=0).to(device=device)
+        root_state[:, 0:3] = base_pos.to(device) + env_origins
+        root_state[:, 3:7] = wxyz.to(device)
+    else:
+        # Keep default positions (already include env origin during writer below)
+        pass
+
+    # Zero root velocities
+    root_state[:, 7:13] = 0.0
+
+    # Prepare joint states
+    joint_pos = asset.data.default_joint_pos[env_ids].clone()
+    joint_vel = torch.zeros_like(joint_pos, device=joint_pos.device)
+
+    # Apply joint positions from animation
+    qpos = anim["qpos"]  # CPU tensor
+    nq = int(anim["nq"])
+
+    for i in range(num_envs):
+        fi = int(frame_indices[i])
+        qrow = qpos[fi]  # CPU
+        for j_idx in range(num_robot_dofs):
+            qidx = joint_index_map[j_idx] if j_idx < len(joint_index_map) else -1
+            if isinstance(qidx, int) and 0 <= qidx < nq:
+                joint_pos[i, j_idx] = qrow[qidx].to(joint_pos.device)
+
+    # Write to sim
+    asset.write_root_pose_to_sim(root_state[:, :7], env_ids=env_ids)
+    asset.write_root_velocity_to_sim(root_state[:, 7:], env_ids=env_ids)
+    asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
