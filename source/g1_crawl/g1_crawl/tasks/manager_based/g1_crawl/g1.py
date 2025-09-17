@@ -211,8 +211,11 @@ def load_animation_json(json_path: str | None = None) -> dict:
     Returns dict with keys:
     - dt: float
     - nq: int
+        - nv: int
     - qpos: torch.FloatTensor [T, nq] (CPU tensor)
+        - qvel: torch.FloatTensor [T, nv] (CPU tensor) if provided
     - qpos_labels: list[str] | None
+        - qvel_labels: list[str] | None
     - metadata: dict
     - base_meta: dict | None (with pos_indices, quat_indices)
     - joints_meta: list|dict mapping joint names to qpos indices
@@ -234,6 +237,7 @@ def load_animation_json(json_path: str | None = None) -> dict:
         dt = 1.0 / 30.0
 
     nq = int(data.get("nq", 0)) or None
+    nv = int(data.get("nv", 0)) or None
 
     if "qpos" in data:
         qpos_list = data["qpos"]
@@ -250,9 +254,31 @@ def load_animation_json(json_path: str | None = None) -> dict:
         nq = qpos_tensor.shape[1]
     elif nq is None:
         nq = qpos_tensor.shape[1]
+    # Optional velocities: accept keys "qvel" or "vel_frames"
+    qvel_tensor = None
+    if "qvel" in data and data["qvel"] is not None:
+        qvel_list = data["qvel"]
+    elif "vel_frames" in data and data["vel_frames"] is not None:
+        qvel_list = data["vel_frames"]
+    else:
+        qvel_list = None
+    if qvel_list is not None:
+        qvel_tensor = torch.tensor(qvel_list, dtype=torch.float32, device="cpu")
+        # Coerce shape if needed and reconcile nv
+        if qvel_tensor.ndim != 2 or qvel_tensor.shape[0] != T:
+            try:
+                qvel_tensor = qvel_tensor.view(T, -1)
+            except Exception:
+                qvel_tensor = None
+        if qvel_tensor is not None:
+            if nv is not None and qvel_tensor.shape[1] != nv:
+                nv = qvel_tensor.shape[1]
+            elif nv is None:
+                nv = qvel_tensor.shape[1]
 
     metadata = data.get("metadata", {}) or {}
     qpos_labels = data.get("qpos_labels", None) or metadata.get("qpos_labels", None)
+    qvel_labels = data.get("qvel_labels", None) or metadata.get("qvel_labels", None)
     base_meta = metadata.get("base", None)
     joints_meta = metadata.get("joints", {}) or {}
     # Sites metadata and positions (optional)
@@ -291,8 +317,11 @@ def load_animation_json(json_path: str | None = None) -> dict:
     return {
         "dt": float(dt),
         "nq": int(nq),
+        "nv": int(nv) if nv is not None else int(0),
         "qpos": qpos_tensor,
+        "qvel": qvel_tensor if qvel_tensor is not None else None,
         "qpos_labels": qpos_labels,
+        "qvel_labels": qvel_labels,
         "metadata": metadata,
         "base_meta": base_meta,
         "joints_meta": joints_meta,

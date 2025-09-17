@@ -383,27 +383,111 @@ def _build_joint_index_map(asset: Articulation, joints_meta, qpos_labels):
     return index_map
 
 
+def _build_joint_velocity_index_map(asset: Articulation, joints_meta, qvel_labels, qpos_labels=None):
+    """Build per-joint mapping into the animation's qvel vector.
+
+    Preference order per joint:
+    1) joints_meta.qveladr if provided
+    2) joints_meta.qposadr (hinge/slide 1-DoF often match)
+    3) label lookup in qvel_labels
+    4) fallback to qpos label lookup
+    """
+    robot_joint_names = asset.data.joint_names
+    index_map: list[int] = []
+    missing: list[str] = []
+
+    name_to_qveladr: dict[str, int] = {}
+    if isinstance(joints_meta, dict):
+        for name, adr in joints_meta.items():
+            try:
+                # Allow either qveladr directly or legacy qposadr
+                if isinstance(adr, dict):
+                    if "qveladr" in adr and isinstance(adr["qveladr"], int):
+                        name_to_qveladr[str(name)] = int(adr["qveladr"])  # type: ignore[index]
+                    elif "qposadr" in adr and isinstance(adr["qposadr"], int):
+                        name_to_qveladr[str(name)] = int(adr["qposadr"])  # type: ignore[index]
+                else:
+                    name_to_qveladr[str(name)] = int(adr)
+            except Exception:
+                continue
+    elif isinstance(joints_meta, list):
+        for item in joints_meta:
+            if not isinstance(item, dict):
+                continue
+            jname = item.get("name")
+            jtype = item.get("type")
+            vadr = item.get("qveladr")
+            padr = item.get("qposadr")
+            vdim = item.get("qveldim", 1)
+            pdim = item.get("qposdim", 1)
+            # Only 1-DoF joints are considered here
+            if (
+                jname is not None
+                and jtype in ("hinge", "slide")
+                and ((isinstance(vadr, int) and int(vdim) == 1) or (isinstance(padr, int) and int(pdim) == 1))
+            ):
+                if isinstance(vadr, int) and int(vdim) == 1:
+                    name_to_qveladr[str(jname)] = int(vadr)
+                elif isinstance(padr, int) and int(pdim) == 1:
+                    name_to_qveladr[str(jname)] = int(padr)
+
+    # Label lookup from qvel labels, with fallback to qpos labels
+    label_lookup: dict[str, int] = {}
+    if qvel_labels is not None:
+        for i, lbl in enumerate(qvel_labels):
+            s = str(lbl)
+            label_lookup[s] = i
+            if s.startswith("joint:"):
+                label_lookup[s[len("joint:"):]] = i
+    if not label_lookup and qpos_labels is not None:
+        for i, lbl in enumerate(qpos_labels):
+            s = str(lbl)
+            label_lookup[s] = i
+            if s.startswith("joint:"):
+                label_lookup[s[len("joint:"):]] = i
+
+    for jn in robot_joint_names:
+        qidx = -1
+        if jn in name_to_qveladr:
+            qidx = name_to_qveladr[jn]
+        else:
+            if jn in label_lookup:
+                qidx = label_lookup[jn]
+            elif ("joint:" + jn) in label_lookup:
+                qidx = label_lookup["joint:" + jn]
+        index_map.append(qidx)
+        if qidx == -1:
+            missing.append(jn)
+
+    if missing:
+        print(f"[WARN] Missing qvel indices for {len(missing)} joints (will keep default zeros)")
+    return index_map
+
+
 def reset_from_animation(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
     json_path: str | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ):
-    """Reset root pose and joint positions from a random frame of an animation JSON.
+    """Reset root pose, joint positions, and joint velocities from a random frame of an animation JSON.
 
-    - Loads animation JSON once and caches it.
-    - Picks a random frame per environment.
-    - If base metadata present, sets base pos/quat. Otherwise keeps defaults.
-    - Sets 1-DOF joint positions based on mapping. Unmapped joints keep defaults.
-    - Sets all velocities to zero.
+    Requires base pose indices and per-frame joint velocities to be present in the animation.
+    Raises an error if any required data or joint index mapping is missing.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     device = asset.device
 
     anim = _get_animation(json_path)
 
-    # Build joint index map once per call (cheap) — could be cached by joint_names hash if needed
+    # Build index maps once per call (cheap) — could be cached by joint_names hash if needed
     joint_index_map = _build_joint_index_map(asset, anim.get("joints_meta"), anim.get("qpos_labels"))
+    joint_vel_index_map = _build_joint_velocity_index_map(
+        asset,
+        anim.get("joints_meta"),
+        anim.get("qvel_labels"),
+        anim.get("qpos_labels"),
+    )
 
     num_envs = len(env_ids)
     num_robot_dofs = asset.data.default_joint_pos.shape[1]
@@ -415,28 +499,24 @@ def reset_from_animation(
     # Prepare root states
     root_state = asset.data.default_root_state[env_ids].clone()
     base_meta = anim.get("base_meta")
-    if base_meta is not None:
-        pos_idx = base_meta.get("pos_indices", None)
-        quat_idx = base_meta.get("quat_indices", None)
-    else:
-        pos_idx, quat_idx = None, None
+    if base_meta is None:
+        raise ValueError("Animation JSON is missing base metadata 'base_meta'.")
+    pos_idx = base_meta.get("pos_indices", None)
+    quat_idx = base_meta.get("quat_indices", None)
+    if pos_idx is None or quat_idx is None:
+        raise ValueError("Animation base metadata must include 'pos_indices' and 'quat_indices'.")
 
     # env origins
     env_origins = env.scene.env_origins[env_ids].to(device=device)
 
-    # Apply base pose from animation if available
-    if pos_idx is not None and quat_idx is not None:
-        # Gather per-env base pose from selected frames
-        qpos = anim["qpos"]  # CPU tensor [T, nq]
-        base_pos = torch.stack([qpos[int(fi), pos_idx] for fi in frame_indices], dim=0).to(device=device)
-        wxyz = torch.stack([qpos[int(fi), quat_idx] for fi in frame_indices], dim=0).to(device=device)
-        root_state[:, 0:3] = base_pos.to(device) + env_origins
-        root_state[:, 3:7] = wxyz.to(device)
-    else:
-        # Keep default positions (already include env origin during writer below)
-        pass
+    # Apply base pose from animation (required)
+    qpos = anim["qpos"]  # CPU tensor [T, nq]
+    base_pos = torch.stack([qpos[int(fi), pos_idx] for fi in frame_indices], dim=0).to(device=device)
+    wxyz = torch.stack([qpos[int(fi), quat_idx] for fi in frame_indices], dim=0).to(device=device)
+    root_state[:, 0:3] = base_pos.to(device) + env_origins
+    root_state[:, 3:7] = wxyz.to(device)
 
-    # Zero root velocities
+    # Zero root velocities (we currently do not map base velocities unless metadata provides explicit indices)
     root_state[:, 7:13] = 0.0
 
     # Prepare joint states
@@ -444,8 +524,23 @@ def reset_from_animation(
     joint_vel = torch.zeros_like(joint_pos, device=joint_pos.device)
 
     # Apply joint positions from animation
-    qpos = anim["qpos"]  # CPU tensor
     nq = int(anim["nq"])
+    # Required joint velocities from animation
+    qvel = anim.get("qvel", None)
+    if not isinstance(qvel, torch.Tensor):
+        raise ValueError("Animation JSON must include per-frame velocities 'qvel'/'vel_frames'.")
+    nv = int(anim.get("nv", 0) or qvel.shape[1])
+    if nv <= 0:
+        raise ValueError("Animation 'nv' must be > 0 when providing velocities.")
+
+    # Validate joint index maps: crash if any joint is unmapped
+    robot_joint_names = asset.data.joint_names
+    missing_pos = [jn for jn, idx in zip(robot_joint_names, joint_index_map) if not (isinstance(idx, int) and idx >= 0)]
+    if missing_pos:
+        raise ValueError(f"Missing qpos indices for joints: {missing_pos}")
+    missing_vel = [jn for jn, idx in zip(robot_joint_names, joint_vel_index_map) if not (isinstance(idx, int) and idx >= 0)]
+    if missing_vel:
+        raise ValueError(f"Missing qvel indices for joints: {missing_vel}")
 
     for i in range(num_envs):
         fi = int(frame_indices[i])
@@ -454,6 +549,12 @@ def reset_from_animation(
             qidx = joint_index_map[j_idx] if j_idx < len(joint_index_map) else -1
             if isinstance(qidx, int) and 0 <= qidx < nq:
                 joint_pos[i, j_idx] = qrow[qidx].to(joint_pos.device)
+        # Apply joint velocities (required)
+        vrow = qvel[fi]
+        for j_idx in range(num_robot_dofs):
+            vidx = joint_vel_index_map[j_idx] if j_idx < len(joint_vel_index_map) else -1
+            if isinstance(vidx, int) and 0 <= vidx < nv:
+                joint_vel[i, j_idx] = vrow[vidx].to(joint_vel.device)
 
     # Write to sim
     asset.write_root_pose_to_sim(root_state[:, :7], env_ids=env_ids)
@@ -463,7 +564,7 @@ def reset_from_animation(
     # Visualize site world positions for the selected frames (if provided in animation)
     sites = anim.get("site_positions", None)
     nsite = int(anim.get("nsite", 0) or 0)
-    if sites is not None and nsite > 0 and is_visualization_available():
+    if is_visualization_available():
         draw_interface = omni_debug_draw.acquire_debug_draw_interface()
         # Clear old points if expired
         current_time = time.time()
