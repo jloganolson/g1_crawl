@@ -322,16 +322,7 @@ def reset_root_state_to_pose(
 
 
 # ===== Animation-based reset helpers and event =====
-from ..g1 import load_animation_json
-
-_ANIM_CACHE: dict | None = None
-
-
-def _get_animation(json_path: str | None = None) -> dict:
-    global _ANIM_CACHE
-    if _ANIM_CACHE is None:
-        _ANIM_CACHE = load_animation_json(json_path)
-    return _ANIM_CACHE
+from ..g1 import get_animation
 
 
 def _build_joint_index_map(asset: Articulation, joints_meta, qpos_labels):
@@ -478,7 +469,7 @@ def reset_from_animation(
     asset: Articulation = env.scene[asset_cfg.name]
     device = asset.device
 
-    anim = _get_animation(json_path)
+    anim = get_animation(json_path)
 
     # Build index maps once per call (cheap) — could be cached by joint_names hash if needed
     joint_index_map = _build_joint_index_map(asset, anim.get("joints_meta"), anim.get("qpos_labels"))
@@ -495,6 +486,14 @@ def reset_from_animation(
     # Choose random frames per env
     T = int(anim["num_frames"])
     frame_indices = torch.randint(low=0, high=T, size=(num_envs,), device="cpu")
+
+    # Also store per-env phase offsets and global cycle time for downstream use (rewards)
+    phase_offsets = (frame_indices.to(device=asset.device, dtype=torch.float32) / float(T))
+    if not hasattr(env, "_anim_phase_offset"):
+        setattr(env, "_anim_phase_offset", torch.zeros(env.num_envs, device=asset.device, dtype=torch.float32))
+    env._anim_phase_offset[env_ids] = phase_offsets  # type: ignore[attr-defined]
+    # store cycle time in seconds
+    setattr(env, "_anim_cycle_time_s", float(T) * float(anim["dt"]))
 
     # Prepare root states
     root_state = asset.data.default_root_state[env_ids].clone()

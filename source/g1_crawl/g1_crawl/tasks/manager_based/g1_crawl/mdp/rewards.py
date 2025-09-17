@@ -15,6 +15,7 @@ import torch
 from typing import TYPE_CHECKING
 
 from isaaclab.assets import  RigidObject
+from isaaclab.assets import Articulation
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
@@ -22,6 +23,10 @@ from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+# Reuse animation helpers
+from ..g1 import get_animation, build_joint_index_map
+from .observations import compute_animation_phase_and_frame
 
 
 def feet_air_time(
@@ -61,6 +66,68 @@ def feet_slide(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = Scen
     body_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2]
     reward = torch.sum(body_vel.norm(dim=-1) * contacts, dim=1)
     return reward
+
+
+def animation_pose_similarity_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Negative L2 pose error between current joint positions and animation frame joints.
+
+    - Uses a per-env advancing animation frame counter stored on the env (initialized on reset).
+    - Advances the frame counter each call by step_dt / anim_dt frames.
+    - Excludes floating base by relying on the joint index map built from animation metadata.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    device = asset.device
+
+    anim = get_animation()
+    qpos: torch.Tensor = anim["qpos"]  # [T, nq] on GPU
+    T = int(anim["num_frames"])
+    anim_dt = float(anim["dt"]) if "dt" in anim else 1.0 / 30.0
+
+    # Build and cache joint index map on the env
+    if not hasattr(env, "_anim_joint_index_map"):
+        index_map_list = build_joint_index_map(asset, anim.get("joints_meta"), anim.get("qpos_labels"))
+        index_map = torch.tensor(index_map_list, dtype=torch.long, device=torch.device("cpu"))
+        setattr(env, "_anim_joint_index_map", index_map)
+    index_map_cpu: torch.Tensor = env._anim_joint_index_map  # type: ignore[attr-defined]
+
+    # Derive frame from episode time + phase offset (single source of truth)
+    # Get frame indices on device and index GPU qpos directly
+    _, frame_idx = compute_animation_phase_and_frame(env)
+
+    # Compute integer frame indices and gather target joints
+    target_qpos = qpos[frame_idx]  # [N, nq]
+    target_joint = target_qpos.index_select(dim=1, index=index_map_cpu.to(device))  # [N, ndofs]
+    target_joint = target_joint.to(dtype=asset.data.joint_pos.dtype)
+
+    # Current joint positions
+    current_joint = asset.data.joint_pos
+    err = current_joint - target_joint
+    # Negative L2 squared per env
+    return -torch.sum(err * err, dim=1)
+
+
+def animation_forward_velocity_similarity_exp(
+    env: ManagerBasedRLEnv,
+    std: float = 0.2,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Exponential tracking of forward (world +X) velocity to animation metadata target.
+
+    Uses metadata key 'base_forward_velocity_mps' if available; otherwise returns zeros.
+    reward = exp(- (vx - vx_target)^2 / std^2)
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    anim = get_animation()
+    meta = anim.get("metadata", {}) or {}
+    vx_target = float(meta.get("base_forward_velocity_mps", 0.0))
+    if vx_target == 0.0 and "base_forward_velocity_mps" not in meta:
+        return torch.zeros(asset.data.root_lin_vel_w.shape[0], device=asset.device)
+    vx = asset.data.root_lin_vel_w[:, 0]
+    err_sq = torch.square(vx - vx_target)
+    return torch.exp(-err_sq / (std ** 2))
 
 
 def track_lin_vel_yz_base_exp(

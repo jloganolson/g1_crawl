@@ -340,6 +340,18 @@ class RewardsCfg:
         },
     )
 
+    # Animation-tracking rewards (initial small weights)
+    anim_pose_similarity = RewTerm(
+        func=mdp.animation_pose_similarity_l2,
+        weight=0.5,
+        params={},
+    )
+    anim_forward_vel = RewTerm(
+        func=mdp.animation_forward_velocity_similarity_exp,
+        weight=0.5,
+        params={"std": 0.2},
+    )
+
 
 @configclass
 class TerminationsCfg:
