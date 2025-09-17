@@ -28,7 +28,7 @@ def compute_animation_phase_and_frame(env: ManagerBasedRLEnv):
     anim_dt = float(anim["dt"]) if "dt" in anim else 1.0 / 30.0
     cycle_time = float(T) * anim_dt
     if not hasattr(env, "_anim_phase_offset"):
-        raise RuntimeError("Missing _anim_phase_offset on env. Ensure reset_from_animation was called.")
+        raise RuntimeError("Missing _anim_phase_offset on env. Ensure reset_from_animation (reset) or init_anim_phase (startup) ran.")
 
     # Choose device: prefer env.device, else use phase offset's device
     device = getattr(env, "device", getattr(env._anim_phase_offset, "device"))  # type: ignore[attr-defined]
@@ -39,3 +39,9 @@ def compute_animation_phase_and_frame(env: ManagerBasedRLEnv):
     phase = (phase_offset + (t_s / cycle_time)) % 1.0
     frame_idx = torch.floor(phase * float(T)).to(dtype=torch.long, device=device)
     return phase, frame_idx
+
+
+def animation_phase(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Per-env animation phase in [0,1), as a column vector for observations."""
+    phase, _ = compute_animation_phase_and_frame(env)
+    return phase.unsqueeze(1)

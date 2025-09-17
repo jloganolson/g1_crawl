@@ -12,6 +12,7 @@ import omni.usd
 from isaacsim.core.utils.extensions import enable_extension
 from pxr import Gf, Sdf, UsdGeom, Vt
 
+
 # Try to import debug drawing - gracefully handle headless mode
 try:
     import isaacsim.util.debug_draw._debug_draw as omni_debug_draw
@@ -460,6 +461,24 @@ def _build_joint_velocity_index_map(asset: Articulation, joints_meta, qvel_label
     return index_map
 
 
+def init_animation_phase_offsets(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None = None,
+):
+    """Initialize per-env animation phase offsets to zeros on device.
+
+    This ensures observations that use phase can run before any reset-based randomization.
+    """
+    print("init_animation_phase_offsets")
+    asset: Articulation = env.scene["robot"]
+    device = asset.device
+    num_envs = env.num_envs
+    setattr(env, "_anim_phase_offset", torch.zeros(num_envs, device=device, dtype=torch.float32))
+ # if not hasattr(env, "_anim_phase_offset"):
+    #     setattr(env, "_anim_phase_offset", torch.zeros(env.num_envs, device=asset.device, dtype=torch.float32))
+    
+
+
 def reset_from_animation(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
@@ -494,11 +513,12 @@ def reset_from_animation(
 
     # Also store per-env phase offsets and global cycle time for downstream use (rewards)
     phase_offsets = (frame_indices.to(device=asset.device, dtype=torch.float32) / float(T))
-    if not hasattr(env, "_anim_phase_offset"):
-        setattr(env, "_anim_phase_offset", torch.zeros(env.num_envs, device=asset.device, dtype=torch.float32))
+    # if not hasattr(env, "_anim_phase_offset"):
+    #     setattr(env, "_anim_phase_offset", torch.zeros(env.num_envs, device=asset.device, dtype=torch.float32))
     env._anim_phase_offset[env_ids] = phase_offsets  # type: ignore[attr-defined]
+    # env.animation_phase_offset[env_ids] = phase_offsets
     # store cycle time in seconds
-    setattr(env, "_anim_cycle_time_s", float(T) * float(anim["dt"]))
+    # setattr(env, "_anim_cycle_time_s", float(T) * float(anim["dt"]))
 
     # Prepare root states
     root_state = asset.data.default_root_state[env_ids].clone()
@@ -565,87 +585,87 @@ def reset_from_animation(
     asset.write_root_velocity_to_sim(root_state[:, 7:], env_ids=env_ids)
     asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
-    # Visualize site world positions for the selected frames (if provided in animation)
-    sites = anim.get("site_positions", None)
-    nsite = int(anim.get("nsite", 0) or 0)
-    if is_visualization_available():
-        draw_interface = omni_debug_draw.acquire_debug_draw_interface()
-        # Clear old points if expired
-        current_time = time.time()
-        if _site_points_drawn and (current_time - _site_points_timestamp) > 1.0:
-            draw_interface.clear_points()
-            # Some versions only support clear_lines; fall back if needed
-            try:
-                pass
-            except Exception:
-                try:
-                    draw_interface.clear_lines()
-                except Exception:
-                    pass
-            globals()["_site_points_drawn"] = False
+    # # Visualize site world positions for the selected frames (if provided in animation)
+    # sites = anim.get("site_positions", None)
+    # nsite = int(anim.get("nsite", 0) or 0)
+    # if is_visualization_available():
+    #     draw_interface = omni_debug_draw.acquire_debug_draw_interface()
+    #     # Clear old points if expired
+    #     current_time = time.time()
+    #     if _site_points_drawn and (current_time - _site_points_timestamp) > 1.0:
+    #         draw_interface.clear_points()
+    #         # Some versions only support clear_lines; fall back if needed
+    #         try:
+    #             pass
+    #         except Exception:
+    #             try:
+    #                 draw_interface.clear_lines()
+    #             except Exception:
+    #                 pass
+    #         globals()["_site_points_drawn"] = False
 
-        point_list = []
-        colors = []
-        sizes = []
-        # Fixed color and size for all site points
-        color = (0.1, 0.7, 1.0, 1.0)
-        size = 8
-        for i in range(num_envs):
-            fi = int(frame_indices[i])
-            pts = sites[fi].detach().cpu()  # [nsite, 3]
-            # Add env origin offset
-            origin = env_origins[i].cpu()
-            for j in range(int(pts.shape[0])):
-                x = float(pts[j, 0].item() + origin[0].item())
-                y = float(pts[j, 1].item() + origin[1].item())
-                z = float(pts[j, 2].item() + origin[2].item())
-                point_list.append((x, y, z))
-                colors.append(color)
-                sizes.append(size)
+    #     point_list = []
+    #     colors = []
+    #     sizes = []
+    #     # Fixed color and size for all site points
+    #     color = (0.1, 0.7, 1.0, 1.0)
+    #     size = 8
+    #     for i in range(num_envs):
+    #         fi = int(frame_indices[i])
+    #         pts = sites[fi].detach().cpu()  # [nsite, 3]
+    #         # Add env origin offset
+    #         origin = env_origins[i].cpu()
+    #         for j in range(int(pts.shape[0])):
+    #             x = float(pts[j, 0].item() + origin[0].item())
+    #             y = float(pts[j, 1].item() + origin[1].item())
+    #             z = float(pts[j, 2].item() + origin[2].item())
+    #             point_list.append((x, y, z))
+    #             colors.append(color)
+    #             sizes.append(size)
 
-        if point_list:
-            try:
-                draw_interface.draw_points(point_list, colors, sizes)
-                globals()["_site_points_timestamp"] = current_time
-                globals()["_site_points_drawn"] = True
-            except Exception as e:
-                # In cases where draw_points isn't available, skip silently
-                print(f"[DEBUG VIZ] draw_points unavailable: {e}")
+    #     if point_list:
+    #         try:
+    #             draw_interface.draw_points(point_list, colors, sizes)
+    #             globals()["_site_points_timestamp"] = current_time
+    #             globals()["_site_points_drawn"] = True
+    #         except Exception as e:
+    #             # In cases where draw_points isn't available, skip silently
+    #             print(f"[DEBUG VIZ] draw_points unavailable: {e}")
 
     # Also draw a single point at each env's base world position for 30 seconds to verify visibility
-    if is_visualization_available():
-        draw_interface = omni_debug_draw.acquire_debug_draw_interface()
-        current_time = time.time()
-        # Clear old base points after 30 seconds
-        if _base_points_drawn and (current_time - _base_points_timestamp) > 30.0:
-            try:
-                draw_interface.clear_points()
-            except Exception:
-                try:
-                    draw_interface.clear_lines()
-                except Exception:
-                    pass
-            globals()["_base_points_drawn"] = False
+    # if is_visualization_available():
+    #     draw_interface = omni_debug_draw.acquire_debug_draw_interface()
+    #     current_time = time.time()
+    #     # Clear old base points after 30 seconds
+    #     if _base_points_drawn and (current_time - _base_points_timestamp) > 30.0:
+    #         try:
+    #             draw_interface.clear_points()
+    #         except Exception:
+    #             try:
+    #                 draw_interface.clear_lines()
+    #             except Exception:
+    #                 pass
+    #         globals()["_base_points_drawn"] = False
 
-        # Build point list at root_state world positions (already includes env origins)
-        base_points = []
-        base_colors = []
-        base_sizes = []
-        base_color = (1.0, 0.1, 0.1, 1.0)
-        base_size = 20
-        rs_cpu = root_state[:, 0:3].detach().cpu()
-        for i in range(len(env_ids)):
-            p = rs_cpu[i]
-            base_points.append((float(p[0].item()), float(p[1].item()), float(p[2].item())))
-            base_colors.append(base_color)
-            base_sizes.append(base_size)
-        if base_points:
-            try:
-                draw_interface.draw_points(base_points, base_colors, base_sizes)
-                globals()["_base_points_timestamp"] = current_time
-                globals()["_base_points_drawn"] = True
-            except Exception as e:
-                print(f"[DEBUG VIZ] draw_points (base) unavailable: {e}")
+    #     # Build point list at root_state world positions (already includes env origins)
+    #     base_points = []
+    #     base_colors = []
+    #     base_sizes = []
+    #     base_color = (1.0, 0.1, 0.1, 1.0)
+    #     base_size = 20
+    #     rs_cpu = root_state[:, 0:3].detach().cpu()
+    #     for i in range(len(env_ids)):
+    #         p = rs_cpu[i]
+    #         base_points.append((float(p[0].item()), float(p[1].item()), float(p[2].item())))
+    #         base_colors.append(base_color)
+    #         base_sizes.append(base_size)
+    #     if base_points:
+    #         try:
+    #             draw_interface.draw_points(base_points, base_colors, base_sizes)
+    #             globals()["_base_points_timestamp"] = current_time
+    #             globals()["_base_points_drawn"] = True
+    #         except Exception as e:
+    #             print(f"[DEBUG VIZ] draw_points (base) unavailable: {e}")
 
 
 def viz_animation_sites_step(
@@ -723,35 +743,35 @@ def viz_animation_sites_step(
             print(f"[DEBUG VIZ] draw_points (anim sites) unavailable: {e}")
 
 
-def viz_base_positions_step(
-    env: ManagerBasedEnv,
-    env_ids: torch.Tensor,
-    max_envs: int = 4,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-):
-    """Visualize base world positions each step for a few envs to confirm interval events run.
+# def viz_base_positions_step(
+#     env: ManagerBasedEnv,
+#     env_ids: torch.Tensor,
+#     max_envs: int = 4,
+#     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+# ):
+#     """Visualize base world positions each step for a few envs to confirm interval events run.
 
-    Draws points at current base positions; no clearing to avoid wiping other debug draws.
-    """
-    if not is_visualization_available():
-        return
-    # if throttle_steps > 1 and (getattr(env, "common_step_counter", 0) % throttle_steps != 0):
-    #     return
+#     Draws points at current base positions; no clearing to avoid wiping other debug draws.
+#     """
+#     if not is_visualization_available():
+#         return
+#     # if throttle_steps > 1 and (getattr(env, "common_step_counter", 0) % throttle_steps != 0):
+#     #     return
     
-    asset: Articulation = env.scene[asset_cfg.name]
-    draw_env_ids = env_ids[: max_envs]
-    if len(draw_env_ids) == 0:
-        return
-    draw_interface = omni_debug_draw.acquire_debug_draw_interface()
-    base_pos_w = asset.data.root_pos_w[draw_env_ids].detach().cpu()
-    point_list = []
-    colors = []
-    sizes = []
-    color = (1.0, 0.1, 0.1, 1.0)
-    size = 12
-    for i in range(len(draw_env_ids)):
-        p = base_pos_w[i]
-        point_list.append((float(p[0].item()), float(p[1].item()), float(p[2].item())))
-        colors.append(color)
-        sizes.append(size)
-    draw_interface.draw_points(point_list, colors, sizes)
+#     asset: Articulation = env.scene[asset_cfg.name]
+#     draw_env_ids = env_ids[: max_envs]
+#     if len(draw_env_ids) == 0:
+#         return
+#     draw_interface = omni_debug_draw.acquire_debug_draw_interface()
+#     base_pos_w = asset.data.root_pos_w[draw_env_ids].detach().cpu()
+#     point_list = []
+#     colors = []
+#     sizes = []
+#     color = (1.0, 0.1, 0.1, 1.0)
+#     size = 12
+#     for i in range(len(draw_env_ids)):
+#         p = base_pos_w[i]
+#         point_list.append((float(p[0].item()), float(p[1].item()), float(p[2].item())))
+#         colors.append(color)
+#         sizes.append(size)
+#     draw_interface.draw_points(point_list, colors, sizes)
