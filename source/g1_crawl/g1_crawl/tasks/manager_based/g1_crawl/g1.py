@@ -200,7 +200,7 @@ def _default_animation_path() -> str:
     this_dir = os.path.dirname(__file__)
     repo_root = os.path.abspath(os.path.join(this_dir, "../../../../../../"))
     # candidate = os.path.join(repo_root, "scripts/experiments/animation_20250915_134944.json")
-    candidate = os.path.join(repo_root, "assets/animation_rc0.json")
+    candidate = os.path.join(repo_root, "assets/animation_rc1.json")
 
     return candidate
 
@@ -255,6 +255,21 @@ def load_animation_json(json_path: str | None = None) -> dict:
     qpos_labels = data.get("qpos_labels", None) or metadata.get("qpos_labels", None)
     base_meta = metadata.get("base", None)
     joints_meta = metadata.get("joints", {}) or {}
+    # Sites metadata and positions (optional)
+    sites_meta = metadata.get("sites", {}) or {}
+    nsite = int(data.get("nsite", 0) or sites_meta.get("nsite", 0) or 0)
+    site_positions_tensor = None
+    if "site_positions" in data and data["site_positions"] is not None:
+        # Expecting [T, nsite, 3]
+        site_positions_tensor = torch.tensor(data["site_positions"], dtype=torch.float32, device="cpu")
+        # Basic sanity: ensure time dimension matches
+        if site_positions_tensor.ndim != 3 or site_positions_tensor.shape[0] != T:
+            # Try to coerce if possible; otherwise, ignore
+            try:
+                site_positions_tensor = site_positions_tensor.view(T, -1, 3)
+                nsite = int(site_positions_tensor.shape[1])
+            except Exception:
+                site_positions_tensor = None
 
     # Normalize base world x/y so the animation starts at the origin.
     # If base position indices are provided, subtract the first frame's x/y from all frames.
@@ -268,6 +283,10 @@ def load_animation_json(json_path: str | None = None) -> dict:
             if x0 != 0.0 or y0 != 0.0:
                 qpos_tensor[:, x_idx] -= x0
                 qpos_tensor[:, y_idx] -= y0
+                # Apply the same shift to site world positions if provided
+                if site_positions_tensor is not None:
+                    site_positions_tensor[:, :, 0] -= x0
+                    site_positions_tensor[:, :, 1] -= y0
 
     return {
         "dt": float(dt),
@@ -277,6 +296,9 @@ def load_animation_json(json_path: str | None = None) -> dict:
         "metadata": metadata,
         "base_meta": base_meta,
         "joints_meta": joints_meta,
+        "nsite": int(nsite),
+        "site_positions": site_positions_tensor,
+        "sites_meta": sites_meta,
         "num_frames": int(T),
         "json_path": path,
     }

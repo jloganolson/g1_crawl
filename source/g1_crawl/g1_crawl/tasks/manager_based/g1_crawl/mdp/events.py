@@ -32,6 +32,12 @@ if TYPE_CHECKING:
 # Global variable to track when push lines were last drawn
 _push_lines_timestamp = 0.0
 _push_lines_drawn = False
+# Separate tracker for site point visualization
+_site_points_timestamp = 0.0
+_site_points_drawn = False
+# Separate tracker for base position points visualization
+_base_points_timestamp = 0.0
+_base_points_drawn = False
 
 
 def is_visualization_available() -> bool:
@@ -453,3 +459,85 @@ def reset_from_animation(
     asset.write_root_pose_to_sim(root_state[:, :7], env_ids=env_ids)
     asset.write_root_velocity_to_sim(root_state[:, 7:], env_ids=env_ids)
     asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+    # Visualize site world positions for the selected frames (if provided in animation)
+    sites = anim.get("site_positions", None)
+    nsite = int(anim.get("nsite", 0) or 0)
+    if sites is not None and nsite > 0 and is_visualization_available():
+        draw_interface = omni_debug_draw.acquire_debug_draw_interface()
+        # Clear old points if expired
+        current_time = time.time()
+        if _site_points_drawn and (current_time - _site_points_timestamp) > 1.0:
+            draw_interface.clear_points()
+            # Some versions only support clear_lines; fall back if needed
+            try:
+                pass
+            except Exception:
+                try:
+                    draw_interface.clear_lines()
+                except Exception:
+                    pass
+            globals()["_site_points_drawn"] = False
+
+        point_list = []
+        colors = []
+        sizes = []
+        # Fixed color and size for all site points
+        color = (0.1, 0.7, 1.0, 1.0)
+        size = 8
+        for i in range(num_envs):
+            fi = int(frame_indices[i])
+            pts = sites[fi]  # [nsite, 3] CPU tensor
+            # Add env origin offset
+            origin = env_origins[i].cpu()
+            for j in range(int(pts.shape[0])):
+                x = float(pts[j, 0].item() + origin[0].item())
+                y = float(pts[j, 1].item() + origin[1].item())
+                z = float(pts[j, 2].item() + origin[2].item())
+                point_list.append((x, y, z))
+                colors.append(color)
+                sizes.append(size)
+
+        if point_list:
+            try:
+                draw_interface.draw_points(point_list, colors, sizes)
+                globals()["_site_points_timestamp"] = current_time
+                globals()["_site_points_drawn"] = True
+            except Exception as e:
+                # In cases where draw_points isn't available, skip silently
+                print(f"[DEBUG VIZ] draw_points unavailable: {e}")
+
+    # Also draw a single point at each env's base world position for 30 seconds to verify visibility
+    if is_visualization_available():
+        draw_interface = omni_debug_draw.acquire_debug_draw_interface()
+        current_time = time.time()
+        # Clear old base points after 30 seconds
+        if _base_points_drawn and (current_time - _base_points_timestamp) > 30.0:
+            try:
+                draw_interface.clear_points()
+            except Exception:
+                try:
+                    draw_interface.clear_lines()
+                except Exception:
+                    pass
+            globals()["_base_points_drawn"] = False
+
+        # Build point list at root_state world positions (already includes env origins)
+        base_points = []
+        base_colors = []
+        base_sizes = []
+        base_color = (1.0, 0.1, 0.1, 1.0)
+        base_size = 20
+        rs_cpu = root_state[:, 0:3].detach().cpu()
+        for i in range(len(env_ids)):
+            p = rs_cpu[i]
+            base_points.append((float(p[0].item()), float(p[1].item()), float(p[2].item())))
+            base_colors.append(base_color)
+            base_sizes.append(base_size)
+        if base_points:
+            try:
+                draw_interface.draw_points(base_points, base_colors, base_sizes)
+                globals()["_base_points_timestamp"] = current_time
+                globals()["_base_points_drawn"] = True
+            except Exception as e:
+                print(f"[DEBUG VIZ] draw_points (base) unavailable: {e}")
