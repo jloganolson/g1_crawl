@@ -12,7 +12,12 @@ from isaaclab.sensors import Camera, Imu, RayCaster, RayCasterCamera, TiledCamer
 from ..g1 import get_animation
 
 if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
+    from isaaclab.envs import ManagerBasedRLEnv
+
+from isaaclab.envs.utils.io_descriptors import (
+    generic_io_descriptor,
+    record_shape,
+)
 
 def compute_animation_phase_and_frame(env: ManagerBasedRLEnv):
     """Compute per-env animation phase and frame index from episode time and phase offset.
@@ -28,7 +33,9 @@ def compute_animation_phase_and_frame(env: ManagerBasedRLEnv):
     anim_dt = float(anim["dt"]) if "dt" in anim else 1.0 / 30.0
     cycle_time = float(T) * anim_dt
     if not hasattr(env, "_anim_phase_offset"):
-        raise RuntimeError("Missing _anim_phase_offset on env. Ensure reset_from_animation (reset) or init_anim_phase (startup) ran.")
+        # raise RuntimeError("Missing _anim_phase_offset on env. Ensure reset_from_animation (reset) or init_anim_phase (startup) ran.")
+        print("Missing _anim_phase_offset on env. Ensure reset_from_animation (reset) or init_anim_phase (startup) ran.")
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32), torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
 
     # Choose device: prefer env.device, else use phase offset's device
     device = getattr(env, "device", getattr(env._anim_phase_offset, "device"))  # type: ignore[attr-defined]
@@ -41,6 +48,7 @@ def compute_animation_phase_and_frame(env: ManagerBasedRLEnv):
     return phase, frame_idx
 
 
+@generic_io_descriptor(dtype=torch.float32, observation_type="RootState", on_inspect=[record_shape])
 def animation_phase(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Per-env animation phase in [0,1), as a column vector for observations."""
     phase, _ = compute_animation_phase_and_frame(env)
