@@ -311,11 +311,11 @@ class RewardsCfg:
         weight=-10.0,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
-    torque_limits = RewTerm(
-        func=mdp.applied_torque_limits,
-        weight=-5.0,
-        params={"asset_cfg": SceneEntityCfg("robot")},
-    )
+    # torque_limits = RewTerm(
+    #     func=mdp.applied_torque_limits,
+    #     weight=-5.0,
+    #     params={"asset_cfg": SceneEntityCfg("robot")},
+    # )
 
     #regulatorization
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-2)
@@ -332,14 +332,14 @@ class RewardsCfg:
             "threshold": 1.0,  # in Newtons (normal force magnitude)
         },
     )
-    slippage = RewTerm(
-        func=mdp.feet_slide, 
-        weight=-.01,
-                params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
-            "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
-        },
-    )
+    # slippage = RewTerm(
+    #     func=mdp.feet_slide, 
+    #     weight=-.01,
+    #             params={
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
+    #         "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
+    #     },
+    # )
 
     # feet_air_time = RewTerm(
     #     func=mdp.feet_air_time,
@@ -354,14 +354,14 @@ class RewardsCfg:
     # Animation-tracking rewards (initial small weights)
     anim_pose_l1 = RewTerm(
         func=mdp.animation_pose_similarity_l1,
-        weight=-1.0,
+        weight=-2.0,
     )
 
     # Contact pattern tracking from animation (strict): FL, FR, RL, RR must match
     # Requires contact sensor to expose bodies in this order; we pass explicit names.
     anim_contact_mismatch_l1 = RewTerm(
         func=mdp.animation_contact_flags_mismatch_feet_l1,
-        weight=-1.0,
+        weight=-2.0,
         params={
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces",
@@ -379,7 +379,7 @@ class RewardsCfg:
 
     anim_forward_vel = RewTerm(
         func=mdp.animation_forward_velocity_similarity_exp,
-        weight=0.5,
+        weight=2.,
         params={"std": 0.5},
     )
 

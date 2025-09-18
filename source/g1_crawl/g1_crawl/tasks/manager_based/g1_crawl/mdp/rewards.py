@@ -92,7 +92,6 @@ def animation_pose_similarity_l1(
     anim = get_animation()
     qpos: torch.Tensor = anim["qpos"]  # [T, nq] on GPU
     T = int(anim["num_frames"])
-    anim_dt = float(anim["dt"]) if "dt" in anim else 1.0 / 30.0
 
     # Build and cache joint index map on the env
     if not hasattr(env, "_anim_joint_index_map"):
@@ -177,19 +176,31 @@ def animation_forward_velocity_similarity_exp(
     std: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Exponential tracking of forward (base +Z) velocity to animation metadata target.
+    """Exponential tracking of base-frame YZ linear velocity to animation target.
 
-    Uses metadata key 'base_forward_velocity_mps' if available; otherwise returns zeros.
-    reward = exp(- (vz_b - v_target)^2 / std^2)
+    Uses metadata key 'base_forward_velocity_mps' to set target vz, with vy target fixed to 0.
+    reward = exp(- ( (vz_b - v_target)^2 + (vy_b - 0)^2 ) / std^2 )
     """
     asset: RigidObject = env.scene[asset_cfg.name]
     anim = get_animation()
     meta = anim.get("metadata", {}) or {}
-    v_target = float(meta.get("base_forward_velocity_mps", 0.0))
-    if v_target == 0.0 and "base_forward_velocity_mps" not in meta:
-        return torch.zeros(asset.data.root_lin_vel_b.shape[0], device=asset.device)
-    vz_b = asset.data.root_lin_vel_b[:, 2]
-    err_sq = torch.square(vz_b - v_target)
+    if "base_forward_velocity_mps" not in meta or meta["base_forward_velocity_mps"] is None:
+        raise RuntimeError("Animation metadata is missing required key 'base_forward_velocity_mps'")
+    if meta["base_forward_velocity_mps"] is None:
+        raise RuntimeError("Animation metadata key 'base_forward_velocity_mps' is None")
+    if torch.isnan(meta["base_forward_velocity_mps"]):
+        raise RuntimeError("Animation metadata key 'base_forward_velocity_mps' is NaN")
+    if meta["base_forward_velocity_mps"] <= 0.0:
+        raise RuntimeError("Animation metadata key 'base_forward_velocity_mps' is less than or equal to 0.0")
+    v_target = float(meta["base_forward_velocity_mps"])
+
+    # Measured base linear velocity in YZ order: [vz, vy]
+    vel_b = asset.data.root_lin_vel_b[:, :3]
+    if torch.isnan(vel_b).any():
+        raise RuntimeError("NaN detected in asset.data.root_lin_vel_b")
+    meas_yz = vel_b[:, [2, 1]]
+    target_yz = torch.tensor([v_target, 0.0], dtype=meas_yz.dtype, device=meas_yz.device)
+    err_sq = torch.sum(torch.square(meas_yz - target_yz), dim=1)
     return torch.exp(-err_sq / (std ** 2))
 
 
