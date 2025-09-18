@@ -68,11 +68,19 @@ def feet_slide(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = Scen
     return reward
 
 
-def animation_pose_similarity_l2(
+def joint_deviation_l1(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize joint positions that deviate from the default one."""
+    # extract the used quantities (to enable type-hinting)
+    asset: Articulation = env.scene[asset_cfg.name]
+    # compute out of limits constraints
+    angle = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    return torch.sum(torch.abs(angle), dim=1)
+
+def animation_pose_similarity_l1(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Negative L2 pose error between current joint positions and animation frame joints.
+    """L1 pose error between current joint positions and animation frame joints.
 
     - Uses a per-env advancing animation frame counter stored on the env (initialized on reset).
     - Advances the frame counter each call by step_dt / anim_dt frames.
@@ -93,20 +101,75 @@ def animation_pose_similarity_l2(
         setattr(env, "_anim_joint_index_map", index_map)
     index_map_cpu: torch.Tensor = env._anim_joint_index_map  # type: ignore[attr-defined]
 
+    # One-time debug print about mapping coverage
+    if not hasattr(env, "_anim_debug_checked"):
+        num_robot_dofs = int(asset.data.joint_pos.shape[1])
+        num_missing = int((index_map_cpu < 0).sum().item())
+        print(f"[anim debug] joint index map built: length={index_map_cpu.shape[0]} robot_dofs={num_robot_dofs} missing={num_missing}")
+        if num_missing > 0:
+            missing_idxs = torch.nonzero(index_map_cpu < 0, as_tuple=False).squeeze(-1).tolist()
+            if not isinstance(missing_idxs, list):
+                missing_idxs = [int(missing_idxs)]
+            sample = missing_idxs[:5]
+            sample_names = [str(asset.data.joint_names[i]) for i in sample]
+            print(f"[anim debug] sample missing joints: {sample_names}")
+        setattr(env, "_anim_debug_checked", True)
+
+    # Validate index map shape and range (allow -1 for missing)
+    num_robot_dofs = int(asset.data.joint_pos.shape[1])
+    if int(index_map_cpu.shape[0]) != num_robot_dofs:
+        raise RuntimeError(f"Animation index map length {int(index_map_cpu.shape[0])} != robot dofs {num_robot_dofs}")
+    nq_anim = int(qpos.shape[1])
+    if torch.any(index_map_cpu >= nq_anim) or torch.any(index_map_cpu < -1):
+        raise RuntimeError("Animation index map contains out-of-range entries (valid are [-1, nq-1])")
+
+    # Ensure all required joints in asset_cfg.joint_ids exist in the animation mapping (fail loudly)
+    joint_ids = asset_cfg.joint_ids
+    if not isinstance(joint_ids, slice):
+        raise TypeError(f"asset_cfg.joint_ids must be a slice; got {type(joint_ids).__name__}")
+    # Expand slice into explicit indices using robot DoF count for validation
+    joint_ids_list = list(range(num_robot_dofs))[joint_ids]
+    required_map = index_map_cpu[joint_ids_list]
+    missing_mask = required_map < 0
+    if torch.any(missing_mask):
+        missing_pos = torch.nonzero(missing_mask, as_tuple=False).squeeze(-1).tolist()
+        if not isinstance(missing_pos, list):
+            missing_pos = [int(missing_pos)]
+        missing_robot_joint_indices = [joint_ids_list[i] for i in missing_pos]
+        missing_joint_names = [str(asset.data.joint_names[i]) for i in missing_robot_joint_indices]
+        raise RuntimeError(
+            f"Animation is missing qpos indices for required joints: {missing_joint_names}"
+        )
+
+    # Ensure phase offsets were initialized
+    if not hasattr(env, "_anim_phase_offset"):
+        raise RuntimeError("Missing _anim_phase_offset on env. Ensure reset_from_animation/init_animation_phase_offsets ran.")
+
     # Derive frame from episode time + phase offset (single source of truth)
     # Get frame indices on device and index GPU qpos directly
     _, frame_idx = compute_animation_phase_and_frame(env)
 
+    # Validate frame indices
+    if frame_idx.dtype != torch.long:
+        raise RuntimeError(f"frame_idx must be torch.long, got {frame_idx.dtype}")
+    if int(frame_idx.shape[0]) != int(asset.data.joint_pos.shape[0]):
+        raise RuntimeError(
+            f"frame_idx length {int(frame_idx.shape[0])} != num_envs {int(asset.data.joint_pos.shape[0])}"
+        )
+    if torch.any(frame_idx < 0) or torch.any(frame_idx >= T):
+        fmin = int(frame_idx.min().item())
+        fmax = int(frame_idx.max().item())
+        raise RuntimeError(f"frame_idx out of range [0,{T-1}]: min={fmin} max={fmax}")
+
     # Compute integer frame indices and gather target joints
     target_qpos = qpos[frame_idx]  # [N, nq]
-    target_joint = target_qpos.index_select(dim=1, index=index_map_cpu.to(device))  # [N, ndofs]
-    target_joint = target_joint.to(dtype=asset.data.joint_pos.dtype)
+    # Map animation qpos to robot joint order
+    target_joint_full = target_qpos.index_select(dim=1, index=index_map_cpu.to(device))  # [N, num_robot_dofs]
+    target_joint_full = target_joint_full.to(dtype=asset.data.joint_pos.dtype)
 
-    # Current joint positions
-    current_joint = asset.data.joint_pos
-    err = current_joint - target_joint
-    # Negative L2 squared per env
-    return -torch.sum(err * err, dim=1)
+    # Mirror joint_deviation_l1 style: operate directly on cfg.joint_ids using L1
+    angle = asset.data.joint_pos[:, asset_cfg.joint_ids] - target_joint_full[:, asset_cfg.joint_ids]
+    return torch.sum(torch.abs(angle), dim=1)
 
 
 def animation_forward_velocity_similarity_exp(

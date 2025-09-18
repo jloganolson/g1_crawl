@@ -352,11 +352,11 @@ class RewardsCfg:
     # )
 
     # Animation-tracking rewards (initial small weights)
-    # anim_pose_similarity = RewTerm(
-    #     func=mdp.animation_pose_similarity_l2,
-    #     weight=1.,
-    #     params={},
-    # )
+    anim_pose_l1 = RewTerm(
+        func=mdp.animation_pose_similarity_l1,
+        weight=-1.0,
+    )
+
     # anim_forward_vel = RewTerm(
     #     func=mdp.animation_forward_velocity_similarity_exp,
     #     weight=0.5,
