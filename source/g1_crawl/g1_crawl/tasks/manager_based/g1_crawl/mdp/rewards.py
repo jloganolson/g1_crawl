@@ -186,10 +186,6 @@ def animation_forward_velocity_similarity_exp(
     meta = anim.get("metadata", {}) or {}
     if "base_forward_velocity_mps" not in meta or meta["base_forward_velocity_mps"] is None:
         raise RuntimeError("Animation metadata is missing required key 'base_forward_velocity_mps'")
-    if meta["base_forward_velocity_mps"] is None:
-        raise RuntimeError("Animation metadata key 'base_forward_velocity_mps' is None")
-    if torch.isnan(meta["base_forward_velocity_mps"]):
-        raise RuntimeError("Animation metadata key 'base_forward_velocity_mps' is NaN")
     if meta["base_forward_velocity_mps"] <= 0.0:
         raise RuntimeError("Animation metadata key 'base_forward_velocity_mps' is less than or equal to 0.0")
     v_target = float(meta["base_forward_velocity_mps"])
