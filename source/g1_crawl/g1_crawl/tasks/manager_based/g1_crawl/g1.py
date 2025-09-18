@@ -199,7 +199,7 @@ def _default_animation_path() -> str:
     # # Compute repo root from this file
     this_dir = os.path.dirname(__file__)
     repo_root = os.path.abspath(os.path.join(this_dir, "../../../../../../"))
-    candidate = os.path.join(repo_root, "assets/animation_rc2.json")
+    candidate = os.path.join(repo_root, "assets/animation_rc3.json")
 
     return candidate
 
@@ -296,6 +296,35 @@ def load_animation_json(json_path: str | None = None) -> dict:
             except Exception:
                 site_positions_tensor = None
 
+    # Required per-frame contact flags: [T, K] with order specified in metadata.contact.order
+    if "contact_flags" not in data or data["contact_flags"] is None:
+        raise RuntimeError("Animation JSON missing required 'contact_flags' array")
+    cf_list = data["contact_flags"]
+    cf_tensor = torch.tensor(cf_list, dtype=torch.float32, device="cpu")
+    if cf_tensor.ndim != 2 or int(cf_tensor.shape[0]) != int(T):
+        raise RuntimeError("contact_flags must be a 2D array with shape [T, K] matching frame count T")
+    if not isinstance(metadata, dict) or "contact" not in metadata or metadata["contact"] is None:
+        raise RuntimeError("Animation JSON missing required 'metadata.contact' block")
+    contact_meta = metadata["contact"]
+    if not isinstance(contact_meta, dict):
+        raise RuntimeError("metadata.contact must be a dict")
+    if "order" not in contact_meta or contact_meta["order"] is None:
+        raise RuntimeError("metadata.contact.order is required and must list contact labels")
+    contact_order = contact_meta["order"]
+    if not isinstance(contact_order, (list, tuple)) or len(contact_order) == 0:
+        raise RuntimeError("metadata.contact.order must be a non-empty list")
+    if int(cf_tensor.shape[1]) != int(len(contact_order)):
+        raise RuntimeError(
+            f"contact_flags column count {int(cf_tensor.shape[1])} does not match metadata.contact.order length {int(len(contact_order))}"
+        )
+    if "threshold_m" not in contact_meta or contact_meta["threshold_m"] is None:
+        raise RuntimeError("metadata.contact.threshold_m is required")
+    try:
+        contact_threshold_m = float(contact_meta["threshold_m"])
+    except Exception:
+        raise RuntimeError("metadata.contact.threshold_m must be a float")
+    contact_flags_tensor = cf_tensor
+
     # Normalize base world x/y so the animation starts at the origin.
     # If base position indices are provided, subtract the first frame's x/y from all frames.
     if base_meta is not None:
@@ -322,6 +351,8 @@ def load_animation_json(json_path: str | None = None) -> dict:
         qvel_tensor = qvel_tensor.to(device)
     if site_positions_tensor is not None:
         site_positions_tensor = site_positions_tensor.to(device)
+    if contact_flags_tensor is not None:
+        contact_flags_tensor = contact_flags_tensor.to(device)
 
     return {
         "dt": float(dt),
@@ -337,6 +368,9 @@ def load_animation_json(json_path: str | None = None) -> dict:
         "nsite": int(nsite),
         "site_positions": site_positions_tensor,
         "sites_meta": sites_meta,
+        "contact_flags": contact_flags_tensor if contact_flags_tensor is not None else None,
+        "contact_order": list(contact_order) if contact_order is not None else None,
+        "contact_threshold_m": float(contact_threshold_m) if contact_threshold_m is not None else None,
         "num_frames": int(T),
         "json_path": path,
     }

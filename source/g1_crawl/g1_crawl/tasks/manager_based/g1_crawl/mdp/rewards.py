@@ -174,22 +174,22 @@ def animation_pose_similarity_l1(
 
 def animation_forward_velocity_similarity_exp(
     env: ManagerBasedRLEnv,
-    std: float = 0.2,
+    std: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Exponential tracking of forward (world +X) velocity to animation metadata target.
+    """Exponential tracking of forward (base +Z) velocity to animation metadata target.
 
     Uses metadata key 'base_forward_velocity_mps' if available; otherwise returns zeros.
-    reward = exp(- (vx - vx_target)^2 / std^2)
+    reward = exp(- (vz_b - v_target)^2 / std^2)
     """
     asset: RigidObject = env.scene[asset_cfg.name]
     anim = get_animation()
     meta = anim.get("metadata", {}) or {}
-    vx_target = float(meta.get("base_forward_velocity_mps", 0.0))
-    if vx_target == 0.0 and "base_forward_velocity_mps" not in meta:
-        return torch.zeros(asset.data.root_lin_vel_w.shape[0], device=asset.device)
-    vx = asset.data.root_lin_vel_w[:, 0]
-    err_sq = torch.square(vx - vx_target)
+    v_target = float(meta.get("base_forward_velocity_mps", 0.0))
+    if v_target == 0.0 and "base_forward_velocity_mps" not in meta:
+        return torch.zeros(asset.data.root_lin_vel_b.shape[0], device=asset.device)
+    vz_b = asset.data.root_lin_vel_b[:, 2]
+    err_sq = torch.square(vz_b - v_target)
     return torch.exp(-err_sq / (std ** 2))
 
 
@@ -315,3 +315,101 @@ def align_projected_gravity_plus_x_l2(
     target = torch.tensor([1.0, 0.0, 0.0], dtype=g_b.dtype, device=g_b.device)
     dist_sq = torch.sum(torch.square(g_b - target), dim=1)
     return 1.0 - 0.5 * dist_sq
+
+
+def animation_contact_flags_mismatch_l1(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    label_groups: list[list[int]],
+    force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """L1 mismatch between animation contact flags and measured contacts.
+
+    - Expects the animation JSON to contain per-frame contact flags under key ``contact_flags``
+      shaped [T, K], with ordering described by ``metadata.contact.order``.
+    - ``label_groups`` must contain K groups, each being a list of indices into ``sensor_cfg.body_ids``
+      corresponding to the bodies that realize contact for that label (logical OR across the group).
+    - Measured contacts are computed from the contact sensor net forces with a force threshold.
+
+    Returns a per-env penalty equal to the sum over labels of |expected - measured| in [0, K].
+    """
+    # Retrieve expected contact flags and ordering from animation
+    anim = get_animation()
+    contact_flags = anim.get("contact_flags", None)
+    if contact_flags is None:
+        raise RuntimeError("Animation JSON is missing 'contact_flags'; cannot compute contact match reward")
+    contact_order = anim.get("contact_order", None)
+    if contact_order is None:
+        raise RuntimeError("Animation JSON is missing 'metadata.contact.order'; cannot align contact labels")
+
+    # Validate label groups length matches flags dimension
+    K = int(contact_flags.shape[1])
+    if len(label_groups) != K:
+        raise RuntimeError(
+            f"label_groups length {len(label_groups)} must match number of contact labels {K} from animation"
+        )
+
+    # Current frame index per env
+    _, frame_idx = compute_animation_phase_and_frame(env)
+
+    # Expected flags for each env at current frame
+    expected: torch.Tensor = contact_flags[frame_idx]  # [N, K], on GPU
+
+    # Measured contacts per body from sensor; produce [N, B] boolean
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    # net_forces_w_history: [N, H, B, 3] -> norm over xyz, max over history -> [N, B]
+    forces_hist = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+    forces_mag = forces_hist.norm(dim=-1)
+    contacts_per_body = (forces_mag.max(dim=1)[0] > float(force_threshold))  # [N, B]
+
+    # Aggregate per label group via OR across group members
+    N = contacts_per_body.shape[0]
+    measured = torch.zeros((N, K), dtype=expected.dtype, device=expected.device)
+    for k in range(K):
+        idxs = label_groups[k]
+        if not isinstance(idxs, (list, tuple)) or len(idxs) == 0:
+            raise RuntimeError(f"label_groups[{k}] must be a non-empty list of indices")
+        # Validate indices bounds against sensor_cfg.body_ids length
+        B = int(contacts_per_body.shape[1])
+        if any((int(i) < 0 or int(i) >= B) for i in idxs):
+            raise RuntimeError(f"label_groups[{k}] contains indices out of range for sensor body set of size {B}")
+        measured[:, k] = contacts_per_body[:, idxs].any(dim=1).to(dtype=expected.dtype)
+
+    # L1 mismatch per env
+    penalty = torch.sum(torch.abs(expected - measured), dim=1)
+    return penalty
+
+
+def animation_contact_flags_mismatch_feet_l1(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """Strict feet contact mismatch penalty using FL/FR/RL/RR ordering.
+
+    Requirements (fail loudly if violated):
+    - Animation must define contact_flags and metadata.contact.order == ["FL","FR","RL","RR"].
+    - Sensor entity must select exactly 4 bodies in the order [FL, FR, RL, RR].
+    """
+    anim = get_animation()
+    contact_order = anim.get("contact_order", None)
+    if contact_order is None:
+        raise RuntimeError("Animation missing contact_order; ensure metadata.contact.order is present")
+    expected_order = ["FL", "FR", "RL", "RR"]
+    if list(contact_order) != expected_order:
+        raise RuntimeError(
+            f"metadata.contact.order must be {expected_order}, got {list(contact_order)}"
+        )
+
+    # Validate sensor body selection count
+    # Note: We can't access names here, so rely on env config to pass bodies in required order.
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    # sensor_cfg.body_ids is resolved by managers; ensure 4 ids were selected
+    num_bodies = int(len(sensor_cfg.body_ids)) if hasattr(sensor_cfg, "body_ids") else -1
+    if num_bodies != 4:
+        raise RuntimeError(
+            f"sensor_cfg must select exactly 4 bodies in FL,FR,RL,RR order; got {num_bodies}"
+        )
+
+    label_groups = [[0], [1], [2], [3]]
+    return animation_contact_flags_mismatch_l1(env, sensor_cfg, label_groups, force_threshold=force_threshold)
