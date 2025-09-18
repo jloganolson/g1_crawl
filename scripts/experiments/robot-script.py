@@ -53,6 +53,16 @@ def scene_reset(scene: InteractiveScene):
     scene.reset()
 
 
+def print_joint_name_index(scene: InteractiveScene):
+    """Print a labeled mapping of joint index -> joint name to CLI."""
+    robot = scene["Robot"]
+    joint_names = robot.data.joint_names
+    print("\n=== Robot joints (index -> name) ===")
+    for i, name in enumerate(joint_names):
+        print(f"[{i:02d}] {str(name)}")
+    print(f"Total joints: {len(joint_names)}")
+
+
 def test_root_movement(scene: InteractiveScene):
     """Test if we can move the robot's root when fix_root_link=True"""
     print("\n=== Testing Root Movement with fix_root_link=True ===")
@@ -145,6 +155,9 @@ def main():
     
     # Play the simulator
     sim.reset()
+    
+    # Print joint index/name mapping once at startup
+    print_joint_name_index(scene)
     
     # Now we are ready!
     print("[INFO]: Setup complete...")
