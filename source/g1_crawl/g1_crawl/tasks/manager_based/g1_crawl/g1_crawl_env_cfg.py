@@ -366,10 +366,10 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces",
                 body_names=[
-                    "left_ankle_roll_link",   # FL
-                    "right_ankle_roll_link",  # FR
-                    "left_wrist_link",        # RL (rear-left arm contact)
-                    "right_wrist_link",       # RR (rear-right arm contact)
+                    "left_wrist_link",        # FL 
+                    "right_wrist_link",       # FR 
+                    "left_ankle_roll_link",   # RL
+                    "right_ankle_roll_link",  # RR
                 ],
             ),
             # Use a reasonable force threshold to detect contact from sensor

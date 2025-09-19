@@ -18,6 +18,14 @@ import carb
 import omni
 from pxr import Usd, Sdf
 ALLOW_ROOT_WRITES = True
+
+# Debug draw (3D overlays) availability
+try:
+    import isaacsim.util.debug_draw._debug_draw as omni_debug_draw  # type: ignore
+    _DEBUG_DRAW_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    omni_debug_draw = None  # type: ignore
+    _DEBUG_DRAW_AVAILABLE = False
 def create_scene_cfg():
     """Create a simple scene with ground, light, and the robot (free root)."""
     class SimpleSceneCfg(InteractiveSceneCfg):
@@ -217,6 +225,164 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Subscribe to keyboard events
     keyboard_subscription = input_interface.subscribe_to_keyboard_events(keyboard, on_keyboard_event)
     
+    # ===== Contact flags 3D visualization (feet/hands) =====
+    def _require_debug_draw():
+        if not _DEBUG_DRAW_AVAILABLE:
+            raise RuntimeError("Debug draw is not available. Ensure visualization mode and debug_draw extension are enabled.")
+
+    def _find_first_match(name_list, patterns):
+        lname = [str(n).lower() for n in name_list]
+        for p in patterns:
+            pl = p.lower()
+            for i, n in enumerate(lname):
+                if pl in n:
+                    return i
+        return None
+
+    def _find_limb_body_indices(asset):
+        names = asset.data.body_names
+        name_to_idx = {str(n): i for i, n in enumerate(names)}
+
+        # Prefer exact known names from env cfg
+        preferred = {
+            "left_foot": "left_ankle_roll_link",
+            "right_foot": "right_ankle_roll_link",
+            "left_hand": "left_wrist_link",
+            "right_hand": "right_wrist_link",
+        }
+
+        resolved: dict[str, int | None] = {k: None for k in preferred.keys()}
+        used_fallback: dict[str, bool] = {k: False for k in preferred.keys()}
+
+        for limb, exact_name in preferred.items():
+            if exact_name in name_to_idx:
+                resolved[limb] = int(name_to_idx[exact_name])
+                print(f"[contacts] {limb} -> '{exact_name}' (index {resolved[limb]}) [exact]")
+            else:
+                # Heuristic substring fallback
+                patterns = []
+                if limb == "left_foot":
+                    patterns = ["left_ankle", "left_foot", "l_ankle", "l_foot", "left_toe", "left_sole"]
+                elif limb == "right_foot":
+                    patterns = ["right_ankle", "right_foot", "r_ankle", "r_foot", "right_toe", "right_sole"]
+                elif limb == "left_hand":
+                    patterns = ["left_wrist", "left_hand", "l_wrist", "l_hand", "left_palm"]
+                elif limb == "right_hand":
+                    patterns = ["right_wrist", "right_hand", "r_wrist", "r_hand", "right_palm"]
+                idx = _find_first_match(names, patterns)
+                if idx is not None:
+                    used_fallback[limb] = True
+                    resolved[limb] = int(idx)
+                    print(f"[contacts] {limb} -> '{names[int(idx)]}' (index {idx}) [fallback-substr]")
+
+        missing = [k for k, v in resolved.items() if v is None]
+        if missing:
+            print(f"[contacts] Available bodies ({len(names)}): {list(names)}")
+            raise RuntimeError(f"Could not locate bodies for: {missing}. Prefer exact names from env cfg.")
+
+        return {k: int(v) for k, v in resolved.items() if v is not None}
+
+    def _resolve_contact_label_indices(contact_order):
+        # Normalize
+        order_raw = list(contact_order)
+        order = [str(x).strip().lower() for x in order_raw]
+
+        # First prefer canonical FL/FR/RL/RR
+        try_map: dict[str, list[str]] = {
+            "left_hand": ["fl", "front_left"],
+            "right_hand": ["fr", "front_right"],
+            "left_foot": ["rl", "rear_left", "back_left"],
+            "right_foot": ["rr", "rear_right", "back_right"],
+        }
+
+        indices: dict[str, int | None] = {k: None for k in try_map.keys()}
+        for limb, keys in try_map.items():
+            for key in keys:
+                for i, s in enumerate(order):
+                    if s == key:
+                        indices[limb] = i
+                        break
+                if indices[limb] is not None:
+                    break
+
+        # Fallback: broader synonyms inside strings
+        def find_fuzzy(candidates):
+            for i, s in enumerate(order):
+                for c in candidates:
+                    if c in s:
+                        return i
+            return None
+
+        if indices["left_hand"] is None:
+            indices["left_hand"] = find_fuzzy(["left_hand", "l_hand", "left_wrist", "l_wrist"])
+        if indices["right_hand"] is None:
+            indices["right_hand"] = find_fuzzy(["right_hand", "r_hand", "right_wrist", "r_wrist"])
+        if indices["left_foot"] is None:
+            indices["left_foot"] = find_fuzzy(["left_foot", "l_foot", "left_toe", "l_toe", "left_ankle"])
+        if indices["right_foot"] is None:
+            indices["right_foot"] = find_fuzzy(["right_foot", "r_foot", "right_toe", "r_toe", "right_ankle"])
+
+        missing = [k for k, v in indices.items() if v is None]
+        if missing:
+            raise RuntimeError(
+                f"Animation contact_order missing required entries for {missing}. Found: {order_raw}"
+            )
+
+        print(
+            "[contacts] contact_order mapping:",
+            {
+                "left_hand": order_raw[int(indices["left_hand"])],
+                "right_hand": order_raw[int(indices["right_hand"])],
+                "left_foot": order_raw[int(indices["left_foot"])],
+                "right_foot": order_raw[int(indices["right_foot"])],
+            },
+        )
+        return {k: int(v) for k, v in indices.items() if v is not None}
+
+    # Prepare mapping once
+    _require_debug_draw()
+    contact_order = anim.get("contact_order", None)
+    if contact_order is None:
+        raise RuntimeError("Animation JSON missing 'metadata.contact.order' for contact visualization")
+    label_indices = _resolve_contact_label_indices(contact_order)
+    body_indices = _find_limb_body_indices(scene["Robot"])
+    print(
+        "[contacts] body mapping:",
+        {
+            k: {
+                "name": str(scene["Robot"].data.body_names[v]),
+                "index": int(v),
+            }
+            for k, v in body_indices.items()
+        },
+    )
+
+    draw_interface = omni_debug_draw.acquire_debug_draw_interface()
+
+    def draw_contact_flags(frame_index: int):
+        flags = anim.get("contact_flags", None)
+        if flags is None:
+            raise RuntimeError("Animation JSON missing 'contact_flags' for contact visualization")
+        # Build points and colors
+        pts = []
+        colors = []
+        sizes = []
+        # Fetch current world positions (single env index 0)
+        body_pos_w = scene["Robot"].data.body_pos_w[0]
+        z_offset = 0.03
+        for limb_name in ["left_hand", "right_hand", "left_foot", "right_foot"]:
+            bidx = body_indices[limb_name]
+            lidx = label_indices[limb_name]
+            p = body_pos_w[bidx]
+            contact_val = float(flags[frame_index, lidx].item())
+            color = (0.1, 0.9, 0.1, 1.0) if contact_val >= 0.5 else (0.9, 0.1, 0.1, 1.0)
+            pts.append((float(p[0].item()), float(p[1].item()), float(p[2].item() + z_offset)))
+            colors.append(color)
+            sizes.append(16)
+        # Clear and draw
+        draw_interface.clear_points()
+        draw_interface.draw_points(pts, colors, sizes)
+
     print(f"Starting animation playback...")
     print(f"Simulation dt: {sim_dt:.4f}s, Animation dt: {anim_dt:.4f}s")
     print(f"Controls:")
@@ -240,6 +406,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             # Always apply current frame to keep articulation stable
             if frame_idx < anim["num_frames"]:
                 apply_animation_frame(scene, anim, frame_idx, joint_index_map)
+                # Draw contact flags at current frame
+                draw_contact_flags(frame_idx)
             
             # Advance frame only if not paused and not in manual stepping mode
             if not paused and not manual_stepping and sim_time - last_frame_time >= anim_dt:
