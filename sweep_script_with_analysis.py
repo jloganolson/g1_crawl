@@ -27,6 +27,21 @@ SWEEP_CONFIG = {
 }
 # =============================================================================
 
+# Exclude rules for parameter combinations.
+# Each rule is a dict mapping parameter names to either:
+#   - a single value (exact match), or
+#   - a list/tuple/set of allowed values (membership match), or
+#   - a callable predicate taking the candidate value and returning True/False.
+# A combination is excluded if it matches ALL key conditions in ANY rule below.
+EXCLUDE_CONFIG = [
+    # Example: exclude the case where all three sweep params are 0.0
+    {
+        "env.rewards.anim_pose_l1.weight": 0.0,
+        "env.rewards.anim_contact_mismatch_l1.weight": 0.0,
+        "env.rewards.anim_forward_vel.weight": 0.0,
+    },
+]
+
 def log_parameter_combination(combination, run_number, total_runs, log_file, status="STARTED", error=None, command_type=None, full_command=None, output_log_path=None):
     """Log parameter combination to a text file with status tracking."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -45,6 +60,39 @@ def log_parameter_combination(combination, run_number, total_runs, log_file, sta
             f.write(f"ERROR: {error}\n")
         f.write("-" * 50 + "\n")
 
+def _value_matches_rule(candidate_value, rule_value):
+    """Return True if candidate_value satisfies rule_value condition."""
+    # Callable predicate
+    if callable(rule_value):
+        return bool(rule_value(candidate_value))
+    # Membership over an iterable of options
+    if isinstance(rule_value, (list, tuple, set)):
+        return candidate_value in rule_value
+    # Exact equality
+    return candidate_value == rule_value
+
+
+def _rule_matches_combination(combination, rule):
+    """Return True if combination satisfies all key conditions in rule."""
+    for param_name, rule_value in rule.items():
+        # If the param is not part of this sweep combination, rule cannot match
+        if param_name not in combination:
+            return False
+        if not _value_matches_rule(combination[param_name], rule_value):
+            return False
+    return True
+
+
+def is_excluded_combination(combination):
+    """Check EXCLUDE_CONFIG to decide if this combination should be filtered out."""
+    if not EXCLUDE_CONFIG:
+        return False
+    for rule in EXCLUDE_CONFIG:
+        if _rule_matches_combination(combination, rule):
+            return True
+    return False
+
+
 def generate_parameter_combinations():
     """Generate all combinations of sweep parameters."""
     sweep_params = SWEEP_CONFIG["SWEEP_PARAMS"]
@@ -58,8 +106,11 @@ def generate_parameter_combinations():
     
     # Generate all combinations
     combinations = []
-    for combination in itertools.product(*param_values):
-        param_dict = dict(zip(param_names, combination))
+    for values in itertools.product(*param_values):
+        param_dict = dict(zip(param_names, values))
+        # Apply exclusion rules
+        if is_excluded_combination(param_dict):
+            continue
         combinations.append(param_dict)
     
     return combinations
