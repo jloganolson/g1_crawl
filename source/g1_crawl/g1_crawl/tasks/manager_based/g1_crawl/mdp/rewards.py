@@ -168,7 +168,35 @@ def animation_pose_similarity_l1(
 
     # Mirror joint_deviation_l1 style: operate directly on cfg.joint_ids using L1
     angle = asset.data.joint_pos[:, asset_cfg.joint_ids] - target_joint_full[:, asset_cfg.joint_ids]
-    return torch.sum(torch.abs(angle), dim=1)
+    reward = torch.sum(torch.abs(angle), dim=1)
+
+    # Non-finite diagnostics (fail loudly)
+    if not torch.isfinite(target_joint_full).all():
+        num_nan = torch.isnan(target_joint_full).sum().item()
+        num_posinf = (target_joint_full == float("inf")).sum().item()
+        num_neginf = (target_joint_full == float("-inf")).sum().item()
+        print(f"[reward debug] animation_pose_similarity_l1: non-finite target_joint_full: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(target_joint_full.shape)}")
+        raise RuntimeError("animation_pose_similarity_l1 encountered non-finite target_joint_full")
+    joint_pos_sel = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    if not torch.isfinite(joint_pos_sel).all():
+        num_nan = torch.isnan(joint_pos_sel).sum().item()
+        num_posinf = (joint_pos_sel == float("inf")).sum().item()
+        num_neginf = (joint_pos_sel == float("-inf")).sum().item()
+        print(f"[reward debug] animation_pose_similarity_l1: non-finite joint_pos: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(joint_pos_sel.shape)}")
+        raise RuntimeError("animation_pose_similarity_l1 encountered non-finite joint_pos")
+    if not torch.isfinite(angle).all():
+        num_nan = torch.isnan(angle).sum().item()
+        num_posinf = (angle == float("inf")).sum().item()
+        num_neginf = (angle == float("-inf")).sum().item()
+        print(f"[reward debug] animation_pose_similarity_l1: non-finite angle: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(angle.shape)}")
+        raise RuntimeError("animation_pose_similarity_l1 encountered non-finite angle")
+    if not torch.isfinite(reward).all():
+        num_nan = torch.isnan(reward).sum().item()
+        num_posinf = (reward == float("inf")).sum().item()
+        num_neginf = (reward == float("-inf")).sum().item()
+        print(f"[reward debug] animation_pose_similarity_l1: non-finite reward: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(reward.shape)}")
+        raise RuntimeError("animation_pose_similarity_l1 produced non-finite reward")
+    return reward
 
 
 def animation_forward_velocity_similarity_exp(
@@ -192,12 +220,35 @@ def animation_forward_velocity_similarity_exp(
 
     # Measured base linear velocity in YZ order: [vz, vy]
     vel_b = asset.data.root_lin_vel_b[:, :3]
-    if torch.isnan(vel_b).any():
-        raise RuntimeError("NaN detected in asset.data.root_lin_vel_b")
+    if not torch.isfinite(vel_b).all():
+        num_nan = torch.isnan(vel_b).sum().item()
+        num_posinf = (vel_b == float("inf")).sum().item()
+        num_neginf = (vel_b == float("-inf")).sum().item()
+        print(f"[reward debug] animation_forward_velocity_similarity_exp: non-finite vel_b: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(vel_b.shape)}")
+        raise RuntimeError("animation_forward_velocity_similarity_exp encountered non-finite vel_b")
     meas_yz = vel_b[:, [2, 1]]
     target_yz = torch.tensor([v_target, 0.0], dtype=meas_yz.dtype, device=meas_yz.device)
+    # Validate std
+    try:
+        std_val = float(std)
+    except Exception:
+        print(f"[reward debug] animation_forward_velocity_similarity_exp: invalid std type: {type(std)} value={std}")
+        raise
+    if not torch.isfinite(torch.tensor(std_val, device=meas_yz.device, dtype=meas_yz.dtype)):
+        print(f"[reward debug] animation_forward_velocity_similarity_exp: non-finite std: {std_val}")
+        raise RuntimeError("animation_forward_velocity_similarity_exp received non-finite std")
+    if std_val <= 0.0:
+        print(f"[reward debug] animation_forward_velocity_similarity_exp: non-positive std: {std_val}")
+        raise RuntimeError("animation_forward_velocity_similarity_exp requires std > 0")
     err_sq = torch.sum(torch.square(meas_yz - target_yz), dim=1)
-    return torch.exp(-err_sq / (std ** 2))
+    out = torch.exp(-err_sq / (std_val ** 2))
+    if not torch.isfinite(out).all():
+        num_nan = torch.isnan(out).sum().item()
+        num_posinf = (out == float("inf")).sum().item()
+        num_neginf = (out == float("-inf")).sum().item()
+        print(f"[reward debug] animation_forward_velocity_similarity_exp: non-finite reward: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} err_sq_min={float(torch.nanmin(err_sq).item()) if err_sq.numel() > 0 else 'n/a'} err_sq_max={float(torch.nanmax(err_sq).item()) if err_sq.numel() > 0 else 'n/a'} std={std_val}")
+        raise RuntimeError("animation_forward_velocity_similarity_exp produced non-finite reward")
+    return out
 
 
 def track_lin_vel_yz_base_exp(
@@ -361,12 +412,24 @@ def animation_contact_flags_mismatch_l1(
 
     # Expected flags for each env at current frame
     expected: torch.Tensor = contact_flags[frame_idx]  # [N, K], on GPU
+    if not torch.isfinite(expected).all():
+        num_nan = torch.isnan(expected).sum().item()
+        num_posinf = (expected == float("inf")).sum().item()
+        num_neginf = (expected == float("-inf")).sum().item()
+        print(f"[reward debug] animation_contact_flags_mismatch_l1: non-finite expected flags: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(expected.shape)}")
+        raise RuntimeError("animation_contact_flags_mismatch_l1 encountered non-finite expected flags")
 
     # Measured contacts per body from sensor; produce [N, B] boolean
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     # net_forces_w_history: [N, H, B, 3] -> norm over xyz, max over history -> [N, B]
     forces_hist = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
     forces_mag = forces_hist.norm(dim=-1)
+    if not torch.isfinite(forces_mag).all():
+        num_nan = torch.isnan(forces_mag).sum().item()
+        num_posinf = (forces_mag == float("inf")).sum().item()
+        num_neginf = (forces_mag == float("-inf")).sum().item()
+        print(f"[reward debug] animation_contact_flags_mismatch_l1: non-finite forces_mag: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(forces_mag.shape)}")
+        raise RuntimeError("animation_contact_flags_mismatch_l1 encountered non-finite forces magnitude from sensor")
     contacts_per_body = (forces_mag.max(dim=1)[0] > float(force_threshold))  # [N, B]
 
     # Aggregate per label group via OR across group members
@@ -381,9 +444,21 @@ def animation_contact_flags_mismatch_l1(
         if any((int(i) < 0 or int(i) >= B) for i in idxs):
             raise RuntimeError(f"label_groups[{k}] contains indices out of range for sensor body set of size {B}")
         measured[:, k] = contacts_per_body[:, idxs].any(dim=1).to(dtype=expected.dtype)
+    if not torch.isfinite(measured).all():
+        num_nan = torch.isnan(measured).sum().item()
+        num_posinf = (measured == float("inf")).sum().item()
+        num_neginf = (measured == float("-inf")).sum().item()
+        print(f"[reward debug] animation_contact_flags_mismatch_l1: non-finite measured flags: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(measured.shape)}")
+        raise RuntimeError("animation_contact_flags_mismatch_l1 encountered non-finite measured flags")
 
     # L1 mismatch per env
     penalty = torch.sum(torch.abs(expected - measured), dim=1)
+    if not torch.isfinite(penalty).all():
+        num_nan = torch.isnan(penalty).sum().item()
+        num_posinf = (penalty == float("inf")).sum().item()
+        num_neginf = (penalty == float("-inf")).sum().item()
+        print(f"[reward debug] animation_contact_flags_mismatch_l1: non-finite penalty: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(penalty.shape)}")
+        raise RuntimeError("animation_contact_flags_mismatch_l1 produced non-finite penalty")
     return penalty
 
 

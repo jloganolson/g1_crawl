@@ -120,7 +120,7 @@ class ObservationsCfg:
         # velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
-        actions = ObsTerm(func=mdp.last_action)
+        actions = ObsTerm(func=mdp.last_action_with_log)
         phase = ObsTerm(func=mdp.animation_phase)
 
         def __post_init__(self):
@@ -140,7 +140,7 @@ class ObservationsCfg:
         # velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        actions = ObsTerm(func=mdp.last_action)
+        actions = ObsTerm(func=mdp.last_action_with_log)
         phase = ObsTerm(func=mdp.animation_phase)
 
         def __post_init__(self):
@@ -311,11 +311,11 @@ class RewardsCfg:
         weight=-10.0,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
-    # torque_limits = RewTerm(
-    #     func=mdp.applied_torque_limits,
-    #     weight=-5.0,
-    #     params={"asset_cfg": SceneEntityCfg("robot")},
-    # )
+    torque_limits = RewTerm(
+        func=mdp.applied_torque_limits,
+        weight=-5.0,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
 
     #regulatorization
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-2)
@@ -361,7 +361,7 @@ class RewardsCfg:
     # Requires contact sensor to expose bodies in this order; we pass explicit names.
     anim_contact_mismatch_l1 = RewTerm(
         func=mdp.animation_contact_flags_mismatch_feet_l1,
-        weight=-2.0,
+        weight=-1.0,
         params={
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces",
@@ -379,7 +379,7 @@ class RewardsCfg:
 
     anim_forward_vel = RewTerm(
         func=mdp.animation_forward_velocity_similarity_exp,
-        weight=2.,
+        weight=1.,
         params={"std": 1.0},  # Increased from 0.5 to soften the exponential curve
     )
 

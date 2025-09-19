@@ -9,7 +9,7 @@ import nanoid as nano
 
 
 # Experiment configuration
-EXPERIMENT_NAME = "g1_crawl_sweep_v10"  
+EXPERIMENT_NAME = "g1_crawl_sweep_novel"  
 START_FROM_RUN = 1  # Set to 1 to start from beginning, or higher to resume from a specific run
 
 # =============================================================================
@@ -22,6 +22,9 @@ SWEEP_CONFIG = {
         "env.rewards.anim_pose_l1.weight": [-2., -1., 0.],
         "env.rewards.anim_contact_mismatch_l1.weight": [-2., -1., 0.],
         "env.rewards.anim_forward_vel.weight": [5., 2., 1., 0.],
+        # "env.rewards.anim_pose_l1.weight": [-2., -1., 0.],
+        # "env.rewards.anim_contact_mismatch_l1.weight": [-2., -1., 0.],
+        # "env.rewards.anim_forward_vel.weight": [5., 2., 1., 0.],
     },
 
 }
