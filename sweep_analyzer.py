@@ -32,10 +32,11 @@ def check_ffmpeg_capabilities():
         'has_drawtext': True
     }
 
-def create_labeled_videos(experiments, timestamp, capabilities=None):
+def create_labeled_videos(experiments, timestamp, capabilities=None, base_output_dir="."):
     """Create individual labeled videos for each experiment."""
     labeled_videos = []
-    temp_dir = f"temp_labeled_{timestamp}"
+    temp_dir_name = f"temp_labeled_{timestamp}"
+    temp_dir = os.path.join(base_output_dir, temp_dir_name)
     os.makedirs(temp_dir, exist_ok=True)
     
     print("🏷️  Creating labeled videos...")
@@ -45,11 +46,13 @@ def create_labeled_videos(experiments, timestamp, capabilities=None):
     print(f"   Using font: {font_file}")
     
     for i, exp in enumerate(experiments, 1):
-        # Use the experiment directory name as the label
+        # Use the 4-char run UUID as the label when available (fallback to folder name)
         folder_name = exp['directory']
-        
-        # Create a clean label - use the full experiment name
-        label_text = f"Run {i:02d}: {folder_name}"
+        run_uuid = None
+        parts = folder_name.rsplit("_", 1)
+        if len(parts) == 2 and len(parts[1]) == 4 and parts[1].isalnum():
+            run_uuid = parts[1]
+        label_text = f"{run_uuid}" if run_uuid else f"{folder_name}"
         
         output_video = os.path.join(temp_dir, f"labeled_{i:02d}.mp4")
         
@@ -71,7 +74,7 @@ def create_labeled_videos(experiments, timestamp, capabilities=None):
     
     return labeled_videos, temp_dir
 
-def analyze_sweep_results(experiment_name, base_logs_dir="logs/rsl_rl", create_overlays=True):
+def analyze_sweep_results(experiment_name, base_logs_dir="logs/rsl_rl", create_overlays=True, output_dir=None):
     """
     Analyze sweep results and create concatenated video with experiment guide.
     
@@ -118,12 +121,16 @@ def analyze_sweep_results(experiment_name, base_logs_dir="logs/rsl_rl", create_o
     
     print(f"📊 Found {len(experiments)} experiments with videos")
     
-    # Create output filenames with timestamp
+    # Prepare output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    experiment_guide_file = f"{experiment_name}_experiment_guide_{timestamp}.txt"
-    video_mapping_file = f"{experiment_name}_video_mapping_{timestamp}.txt"
-    concat_video_file = f"{experiment_name}_concatenated_{timestamp}.mp4"
-    concat_labeled_video_file = f"{experiment_name}_concatenated_labeled_{timestamp}.mp4"
+    if output_dir is None:
+        output_dir = os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
+
+    experiment_guide_file = os.path.join(output_dir, f"{experiment_name}_experiment_guide_{timestamp}.txt")
+    video_mapping_file = os.path.join(output_dir, f"{experiment_name}_video_mapping_{timestamp}.txt")
+    concat_video_file = os.path.join(output_dir, f"{experiment_name}_concatenated_{timestamp}.mp4")
+    concat_labeled_video_file = os.path.join(output_dir, f"{experiment_name}_concatenated_labeled_{timestamp}.mp4")
     
     # Create experiment guide
     with open(experiment_guide_file, "w") as f:
@@ -133,7 +140,14 @@ def analyze_sweep_results(experiment_name, base_logs_dir="logs/rsl_rl", create_o
         f.write(f"Found {len(experiments)} experiments with videos\n\n")
         
         for i, exp in enumerate(experiments, 1):
-            f.write(f"Run {i:2d}: {exp['directory']}\n")
+            # Include the 4-char run UUID if present in directory name
+            folder_name = exp['directory']
+            run_uuid = None
+            parts = folder_name.rsplit("_", 1)
+            if len(parts) == 2 and len(parts[1]) == 4 and parts[1].isalnum():
+                run_uuid = parts[1]
+            header = f"Run {i:2d}: [{run_uuid}] {folder_name}" if run_uuid else f"Run {i:2d}: {folder_name}"
+            f.write(header + "\n")
             f.write(f"  Video: {exp['video_path']}\n")
             f.write(f"  Config: Agent={'✓' if exp['params'].get('has_agent_config') else '✗'}, "
                    f"Env={'✓' if exp['params'].get('has_env_config') else '✗'}\n")
@@ -151,7 +165,7 @@ def analyze_sweep_results(experiment_name, base_logs_dir="logs/rsl_rl", create_o
     
     try:
         # Create basic concatenated video (always works)
-        concat_file = f"temp_concat_{timestamp}.txt"
+        concat_file = os.path.join(output_dir, f"temp_concat_{timestamp}.txt")
         with open(concat_file, "w") as f:
             for exp in experiments:
                 f.write(f"file '{os.path.abspath(exp['video_path'])}'\n")
@@ -168,11 +182,11 @@ def analyze_sweep_results(experiment_name, base_logs_dir="logs/rsl_rl", create_o
         video_created = True
         
         # Create labeled video - user validated the ffmpeg command works
-        labeled_videos, temp_dir = create_labeled_videos(experiments, timestamp, capabilities)
+        labeled_videos, temp_dir = create_labeled_videos(experiments, timestamp, capabilities, base_output_dir=output_dir)
         
         if labeled_videos:
             # Create concat file for labeled videos
-            labeled_concat_file = f"temp_labeled_concat_{timestamp}.txt"
+            labeled_concat_file = os.path.join(output_dir, f"temp_labeled_concat_{timestamp}.txt")
             with open(labeled_concat_file, "w") as f:
                 for video in labeled_videos:
                     f.write(f"file '{os.path.abspath(video)}'\n")
@@ -206,7 +220,13 @@ def analyze_sweep_results(experiment_name, base_logs_dir="logs/rsl_rl", create_o
             f.write(f"(Each segment is approximately 4 seconds long)\n\n")
             
             for i, exp in enumerate(experiments, 1):
-                f.write(f"Segment {i:2d} ({(i-1)*4:2.0f}s-{i*4:2.0f}s): {exp['directory']}\n")
+                folder_name = exp['directory']
+                run_uuid = None
+                parts = folder_name.rsplit("_", 1)
+                if len(parts) == 2 and len(parts[1]) == 4 and parts[1].isalnum():
+                    run_uuid = parts[1]
+                segment_label = f"{folder_name} [{run_uuid}]" if run_uuid else folder_name
+                f.write(f"Segment {i:2d} ({(i-1)*4:2.0f}s-{i*4:2.0f}s): {segment_label}\n")
                 f.write(f"    Video source: {exp['video_path']}\n")
                 f.write("\n")
         
