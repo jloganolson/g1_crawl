@@ -332,14 +332,14 @@ class RewardsCfg:
             "threshold": 1.0,  # in Newtons (normal force magnitude)
         },
     )
-    # slippage = RewTerm(
-    #     func=mdp.feet_slide, 
-    #     weight=-.01,
-    #             params={
-    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
-    #         "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
-    #     },
-    # )
+    slippage = RewTerm(
+        func=mdp.feet_slide, 
+        weight=-.01,
+                params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
+            "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
+        },
+    )
 
     # feet_air_time = RewTerm(
     #     func=mdp.feet_air_time,
@@ -378,7 +378,7 @@ class RewardsCfg:
     )
 
     anim_forward_vel = RewTerm(
-        func=mdp.animation_forward_velocity_similarity_exp,
+        func=mdp.animation_forward_velocity_similarity_world_exp,
         weight=1.,
         params={"std": 1.0},  # Increased from 0.5 to soften the exponential curve
     )

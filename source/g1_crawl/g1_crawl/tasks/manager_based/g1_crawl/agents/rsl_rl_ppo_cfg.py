@@ -11,11 +11,11 @@ from .symmetry_func import data_augmentation_func_g1
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    max_iterations = 1500#2000
+    max_iterations = 1500
     save_interval = 250
     experiment_name = "g1_crawl_base"
     empirical_normalization = False
-    # clip_actions = 1.0
+    clip_actions = 50.0
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_hidden_dims=[256, 128, 128],

@@ -148,17 +148,6 @@ def animation_pose_similarity_l1(
     # Get frame indices on device and index GPU qpos directly
     _, frame_idx = compute_animation_phase_and_frame(env)
 
-    # Validate frame indices
-    if frame_idx.dtype != torch.long:
-        raise RuntimeError(f"frame_idx must be torch.long, got {frame_idx.dtype}")
-    if int(frame_idx.shape[0]) != int(asset.data.joint_pos.shape[0]):
-        raise RuntimeError(
-            f"frame_idx length {int(frame_idx.shape[0])} != num_envs {int(asset.data.joint_pos.shape[0])}"
-        )
-    if torch.any(frame_idx < 0) or torch.any(frame_idx >= T):
-        fmin = int(frame_idx.min().item())
-        fmax = int(frame_idx.max().item())
-        raise RuntimeError(f"frame_idx out of range [0,{T-1}]: min={fmin} max={fmax}")
 
     # Compute integer frame indices and gather target joints
     target_qpos = qpos[frame_idx]  # [N, nq]
@@ -170,32 +159,7 @@ def animation_pose_similarity_l1(
     angle = asset.data.joint_pos[:, asset_cfg.joint_ids] - target_joint_full[:, asset_cfg.joint_ids]
     reward = torch.sum(torch.abs(angle), dim=1)
 
-    # Non-finite diagnostics (fail loudly)
-    if not torch.isfinite(target_joint_full).all():
-        num_nan = torch.isnan(target_joint_full).sum().item()
-        num_posinf = (target_joint_full == float("inf")).sum().item()
-        num_neginf = (target_joint_full == float("-inf")).sum().item()
-        print(f"[reward debug] animation_pose_similarity_l1: non-finite target_joint_full: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(target_joint_full.shape)}")
-        raise RuntimeError("animation_pose_similarity_l1 encountered non-finite target_joint_full")
-    joint_pos_sel = asset.data.joint_pos[:, asset_cfg.joint_ids]
-    if not torch.isfinite(joint_pos_sel).all():
-        num_nan = torch.isnan(joint_pos_sel).sum().item()
-        num_posinf = (joint_pos_sel == float("inf")).sum().item()
-        num_neginf = (joint_pos_sel == float("-inf")).sum().item()
-        print(f"[reward debug] animation_pose_similarity_l1: non-finite joint_pos: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(joint_pos_sel.shape)}")
-        raise RuntimeError("animation_pose_similarity_l1 encountered non-finite joint_pos")
-    if not torch.isfinite(angle).all():
-        num_nan = torch.isnan(angle).sum().item()
-        num_posinf = (angle == float("inf")).sum().item()
-        num_neginf = (angle == float("-inf")).sum().item()
-        print(f"[reward debug] animation_pose_similarity_l1: non-finite angle: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(angle.shape)}")
-        raise RuntimeError("animation_pose_similarity_l1 encountered non-finite angle")
-    if not torch.isfinite(reward).all():
-        num_nan = torch.isnan(reward).sum().item()
-        num_posinf = (reward == float("inf")).sum().item()
-        num_neginf = (reward == float("-inf")).sum().item()
-        print(f"[reward debug] animation_pose_similarity_l1: non-finite reward: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(reward.shape)}")
-        raise RuntimeError("animation_pose_similarity_l1 produced non-finite reward")
+
     return reward
 
 
@@ -248,6 +212,58 @@ def animation_forward_velocity_similarity_exp(
         num_neginf = (out == float("-inf")).sum().item()
         print(f"[reward debug] animation_forward_velocity_similarity_exp: non-finite reward: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} err_sq_min={float(torch.nanmin(err_sq).item()) if err_sq.numel() > 0 else 'n/a'} err_sq_max={float(torch.nanmax(err_sq).item()) if err_sq.numel() > 0 else 'n/a'} std={std_val}")
         raise RuntimeError("animation_forward_velocity_similarity_exp produced non-finite reward")
+    return out
+
+
+def animation_forward_velocity_similarity_world_exp(
+    env: ManagerBasedRLEnv,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Exponential tracking of world-frame XY linear velocity to animation target.
+
+    Uses metadata key 'base_forward_velocity_mps' to set target vx (world +x), with vy target fixed to 0.
+    reward = exp(- ( (vx_w - v_target)^2 + (vy_w - 0)^2 ) / std^2 )
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    anim = get_animation()
+    meta = anim.get("metadata", {}) or {}
+    if "base_forward_velocity_mps" not in meta or meta["base_forward_velocity_mps"] is None:
+        raise RuntimeError("Animation metadata is missing required key 'base_forward_velocity_mps'")
+    if meta["base_forward_velocity_mps"] <= 0.0:
+        raise RuntimeError("Animation metadata key 'base_forward_velocity_mps' is less than or equal to 0.0")
+    v_target = float(meta["base_forward_velocity_mps"])
+
+    # Measured base linear velocity in world frame XY order: [vx, vy]
+    vel_w = asset.data.root_lin_vel_w[:, :3]
+    if not torch.isfinite(vel_w).all():
+        num_nan = torch.isnan(vel_w).sum().item()
+        num_posinf = (vel_w == float("inf")).sum().item()
+        num_neginf = (vel_w == float("-inf")).sum().item()
+        print(f"[reward debug] animation_forward_velocity_similarity_world_exp: non-finite vel_w: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(vel_w.shape)}")
+        raise RuntimeError("animation_forward_velocity_similarity_world_exp encountered non-finite vel_w")
+    meas_xy = vel_w[:, [0, 1]]
+    target_xy = torch.tensor([v_target, 0.0], dtype=meas_xy.dtype, device=meas_xy.device)
+    # Validate std
+    try:
+        std_val = float(std)
+    except Exception:
+        print(f"[reward debug] animation_forward_velocity_similarity_world_exp: invalid std type: {type(std)} value={std}")
+        raise
+    if not torch.isfinite(torch.tensor(std_val, device=meas_xy.device, dtype=meas_xy.dtype)):
+        print(f"[reward debug] animation_forward_velocity_similarity_world_exp: non-finite std: {std_val}")
+        raise RuntimeError("animation_forward_velocity_similarity_world_exp received non-finite std")
+    if std_val <= 0.0:
+        print(f"[reward debug] animation_forward_velocity_similarity_world_exp: non-positive std: {std_val}")
+        raise RuntimeError("animation_forward_velocity_similarity_world_exp requires std > 0")
+    err_sq = torch.sum(torch.square(meas_xy - target_xy), dim=1)
+    out = torch.exp(-err_sq / (std_val ** 2))
+    if not torch.isfinite(out).all():
+        num_nan = torch.isnan(out).sum().item()
+        num_posinf = (out == float("inf")).sum().item()
+        num_neginf = (out == float("-inf")).sum().item()
+        print(f"[reward debug] animation_forward_velocity_similarity_world_exp: non-finite reward: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} err_sq_min={float(torch.nanmin(err_sq).item()) if err_sq.numel() > 0 else 'n/a'} err_sq_max={float(torch.nanmax(err_sq).item()) if err_sq.numel() > 0 else 'n/a'} std={std_val}")
+        raise RuntimeError("animation_forward_velocity_similarity_world_exp produced non-finite reward")
     return out
 
 

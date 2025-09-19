@@ -48,42 +48,10 @@ def compute_animation_phase_and_frame(env: ManagerBasedRLEnv):
     t_s = env.episode_length_buf.to(device=device, dtype=torch.float32) * float(env.step_dt)
     phase_offset = env._anim_phase_offset.to(device=device, dtype=torch.float32)  # type: ignore[attr-defined]
 
-    # Shape checks
-    # if t_s.ndim != 1 or t_s.shape[0] != env.num_envs:
-    #     raise ValueError(f"t_s has invalid shape {tuple(t_s.shape)}; expected ({env.num_envs},)")
-    # if phase_offset.ndim != 1 or phase_offset.shape[0] != env.num_envs:
-    #     raise ValueError(f"phase_offset has invalid shape {tuple(phase_offset.shape)}; expected ({env.num_envs},)")
-
-    # Finite checks before using values
-    # if not torch.isfinite(t_s).all():
-    #     num_bad = (~torch.isfinite(t_s)).sum().item()
-    #     raise ValueError(f"t_s contains non-finite values (count={num_bad}); step_dt={float(env.step_dt)}")
-    # if not torch.isfinite(phase_offset).all():
-    #     num_bad = (~torch.isfinite(phase_offset)).sum().item()
-    #     raise ValueError(f"phase_offset contains non-finite values (count={num_bad})")
 
     phase = (phase_offset + (t_s / cycle_time)) % 1.0
 
-    # Phase validity checks
-    # if phase.ndim != 1 or phase.shape[0] != env.num_envs:
-    #     raise ValueError(f"phase has invalid shape {tuple(phase.shape)}; expected ({env.num_envs},)")
-    # if not torch.isfinite(phase).all():
-    #     num_bad = (~torch.isfinite(phase)).sum().item()
-    #     raise ValueError(f"phase contains non-finite values (count={num_bad})")
-    # if not (torch.ge(phase, 0.0).all() and torch.lt(phase, 1.0).all()):
-    #     pmin = phase.min().item()
-    #     pmax = phase.max().item()
-    #     raise ValueError(f"phase out of range [0,1): min={pmin}, max={pmax}")
 
-    # Rare debug print (≈1 in 5000 calls)
-    # if random.randint(1, 5000) == 1:
-    #     print(
-    #         f"[observations] anim dbg: T={T}, anim_dt={anim_dt:.6g}, cycle_time={cycle_time:.6g}, "
-    #         f"step_dt={float(env.step_dt):.6g}, num_envs={env.num_envs}, phase.shape={tuple(phase.shape)}, "
-    #         f"t_s=[min={t_s.min().item():.6g}, max={t_s.max().item():.6g}], "
-    #         f"phase_offset=[min={phase_offset.min().item():.6g}, max={phase_offset.max().item():.6g}], "
-    #         f"phase=[min={phase.min().item():.6g}, max={phase.max().item():.6g}]"
-    #     )
     frame_idx = torch.floor(phase * float(T)).to(dtype=torch.long, device=device)
     return phase, frame_idx
 
@@ -106,17 +74,25 @@ def last_action_with_log(env: ManagerBasedEnv, action_name: str | None = None) -
     action = env.action_manager.action
     action_max = action.max().item()
     action_min = action.min().item()
-    if not torch.isfinite(action).all():
-        num_nan = torch.isnan(action).sum().item()
-        num_posinf = (action == float("inf")).sum().item()
-        num_neginf = (action == float("-inf")).sum().item()
-        raise RuntimeError(f"last_action_with_log: action contains non-finite values: NaN={num_nan}, +Inf={num_posinf}, -Inf={num_neginf}")
-    if action_max > 50 or action_min < -50:
-        print(action_max, action_min)
-    # env.extras["metrics"] = {
-    #     "action_max": action_max,
-    #     "action_min": action_min,
-    # }
+    if action_max > 40 or action_min < -40:
+        action_max_idx = action.argmax().item()
+        action_min_idx = action.argmin().item()
+        
+        # Convert flat indices to (env_idx, joint_idx)
+        num_joints = action.shape[1]
+        max_env_idx = action_max_idx // num_joints
+        max_joint_idx = action_max_idx % num_joints
+        min_env_idx = action_min_idx // num_joints
+        min_joint_idx = action_min_idx % num_joints
+        
+        # Get joint names for debugging
+        robot = env.scene["robot"]
+        joint_names = robot.data.joint_names
+        max_joint_name = joint_names[max_joint_idx] if max_joint_idx < len(joint_names) else f"joint_{max_joint_idx}"
+        min_joint_name = joint_names[min_joint_idx] if min_joint_idx < len(joint_names) else f"joint_{min_joint_idx}"
+        
+        print(f"action_max: {action_max} (env={max_env_idx}, joint={max_joint_name}), action_min: {action_min} (env={min_env_idx}, joint={min_joint_name})")
+
     if action_name is None:
         return env.action_manager.action
     else:
