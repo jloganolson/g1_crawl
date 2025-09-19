@@ -15,6 +15,7 @@ import torch
 from typing import TYPE_CHECKING
 
 from isaaclab.assets import  RigidObject
+from isaaclab.assets import Articulation
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
@@ -22,6 +23,10 @@ from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+# Reuse animation helpers
+from ..g1 import get_animation, build_joint_index_map
+from .observations import compute_animation_phase_and_frame
 
 
 def feet_air_time(
@@ -61,6 +66,205 @@ def feet_slide(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = Scen
     body_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2]
     reward = torch.sum(body_vel.norm(dim=-1) * contacts, dim=1)
     return reward
+
+
+def joint_deviation_l1(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize joint positions that deviate from the default one."""
+    # extract the used quantities (to enable type-hinting)
+    asset: Articulation = env.scene[asset_cfg.name]
+    # compute out of limits constraints
+    angle = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    return torch.sum(torch.abs(angle), dim=1)
+
+def animation_pose_similarity_l1(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """L1 pose error between current joint positions and animation frame joints.
+
+    - Uses a per-env advancing animation frame counter stored on the env (initialized on reset).
+    - Advances the frame counter each call by step_dt / anim_dt frames.
+    - Excludes floating base by relying on the joint index map built from animation metadata.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    device = asset.device
+
+    anim = get_animation()
+    qpos: torch.Tensor = anim["qpos"]  # [T, nq] on GPU
+    T = int(anim["num_frames"])
+
+    # Build and cache joint index map on the env
+    if not hasattr(env, "_anim_joint_index_map"):
+        index_map_list = build_joint_index_map(asset, anim.get("joints_meta"), anim.get("qpos_labels"))
+        index_map = torch.tensor(index_map_list, dtype=torch.long, device=torch.device("cpu"))
+        setattr(env, "_anim_joint_index_map", index_map)
+    index_map_cpu: torch.Tensor = env._anim_joint_index_map  # type: ignore[attr-defined]
+
+    # One-time debug print about mapping coverage
+    if not hasattr(env, "_anim_debug_checked"):
+        num_robot_dofs = int(asset.data.joint_pos.shape[1])
+        num_missing = int((index_map_cpu < 0).sum().item())
+        print(f"[anim debug] joint index map built: length={index_map_cpu.shape[0]} robot_dofs={num_robot_dofs} missing={num_missing}")
+        if num_missing > 0:
+            missing_idxs = torch.nonzero(index_map_cpu < 0, as_tuple=False).squeeze(-1).tolist()
+            if not isinstance(missing_idxs, list):
+                missing_idxs = [int(missing_idxs)]
+            sample = missing_idxs[:5]
+            sample_names = [str(asset.data.joint_names[i]) for i in sample]
+            print(f"[anim debug] sample missing joints: {sample_names}")
+        setattr(env, "_anim_debug_checked", True)
+
+    # Validate index map shape and range (allow -1 for missing)
+    num_robot_dofs = int(asset.data.joint_pos.shape[1])
+    if int(index_map_cpu.shape[0]) != num_robot_dofs:
+        raise RuntimeError(f"Animation index map length {int(index_map_cpu.shape[0])} != robot dofs {num_robot_dofs}")
+    nq_anim = int(qpos.shape[1])
+    if torch.any(index_map_cpu >= nq_anim) or torch.any(index_map_cpu < -1):
+        raise RuntimeError("Animation index map contains out-of-range entries (valid are [-1, nq-1])")
+
+    # Ensure all required joints in asset_cfg.joint_ids exist in the animation mapping (fail loudly)
+    joint_ids = asset_cfg.joint_ids
+    if not isinstance(joint_ids, slice):
+        raise TypeError(f"asset_cfg.joint_ids must be a slice; got {type(joint_ids).__name__}")
+    # Expand slice into explicit indices using robot DoF count for validation
+    joint_ids_list = list(range(num_robot_dofs))[joint_ids]
+    required_map = index_map_cpu[joint_ids_list]
+    missing_mask = required_map < 0
+    if torch.any(missing_mask):
+        missing_pos = torch.nonzero(missing_mask, as_tuple=False).squeeze(-1).tolist()
+        if not isinstance(missing_pos, list):
+            missing_pos = [int(missing_pos)]
+        missing_robot_joint_indices = [joint_ids_list[i] for i in missing_pos]
+        missing_joint_names = [str(asset.data.joint_names[i]) for i in missing_robot_joint_indices]
+        raise RuntimeError(
+            f"Animation is missing qpos indices for required joints: {missing_joint_names}"
+        )
+
+    # Ensure phase offsets were initialized
+    if not hasattr(env, "_anim_phase_offset"):
+        raise RuntimeError("Missing _anim_phase_offset on env. Ensure reset_from_animation/init_animation_phase_offsets ran.")
+
+    # Derive frame from episode time + phase offset (single source of truth)
+    # Get frame indices on device and index GPU qpos directly
+    _, frame_idx = compute_animation_phase_and_frame(env)
+
+
+    # Compute integer frame indices and gather target joints
+    target_qpos = qpos[frame_idx]  # [N, nq]
+    # Map animation qpos to robot joint order
+    target_joint_full = target_qpos.index_select(dim=1, index=index_map_cpu.to(device))  # [N, num_robot_dofs]
+    target_joint_full = target_joint_full.to(dtype=asset.data.joint_pos.dtype)
+
+    # Mirror joint_deviation_l1 style: operate directly on cfg.joint_ids using L1
+    angle = asset.data.joint_pos[:, asset_cfg.joint_ids] - target_joint_full[:, asset_cfg.joint_ids]
+    reward = torch.sum(torch.abs(angle), dim=1)
+
+
+    return reward
+
+
+def animation_forward_velocity_similarity_exp(
+    env: ManagerBasedRLEnv,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Exponential tracking of base-frame YZ linear velocity to animation target.
+
+    Uses metadata key 'base_forward_velocity_mps' to set target vz, with vy target fixed to 0.
+    reward = exp(- ( (vz_b - v_target)^2 + (vy_b - 0)^2 ) / std^2 )
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    anim = get_animation()
+    meta = anim.get("metadata", {}) or {}
+    if "base_forward_velocity_mps" not in meta or meta["base_forward_velocity_mps"] is None:
+        raise RuntimeError("Animation metadata is missing required key 'base_forward_velocity_mps'")
+    if meta["base_forward_velocity_mps"] <= 0.0:
+        raise RuntimeError("Animation metadata key 'base_forward_velocity_mps' is less than or equal to 0.0")
+    v_target = float(meta["base_forward_velocity_mps"])
+
+    # Measured base linear velocity in YZ order: [vz, vy]
+    vel_b = asset.data.root_lin_vel_b[:, :3]
+    if not torch.isfinite(vel_b).all():
+        num_nan = torch.isnan(vel_b).sum().item()
+        num_posinf = (vel_b == float("inf")).sum().item()
+        num_neginf = (vel_b == float("-inf")).sum().item()
+        print(f"[reward debug] animation_forward_velocity_similarity_exp: non-finite vel_b: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(vel_b.shape)}")
+        raise RuntimeError("animation_forward_velocity_similarity_exp encountered non-finite vel_b")
+    meas_yz = vel_b[:, [2, 1]]
+    target_yz = torch.tensor([v_target, 0.0], dtype=meas_yz.dtype, device=meas_yz.device)
+    # Validate std
+    try:
+        std_val = float(std)
+    except Exception:
+        print(f"[reward debug] animation_forward_velocity_similarity_exp: invalid std type: {type(std)} value={std}")
+        raise
+    if not torch.isfinite(torch.tensor(std_val, device=meas_yz.device, dtype=meas_yz.dtype)):
+        print(f"[reward debug] animation_forward_velocity_similarity_exp: non-finite std: {std_val}")
+        raise RuntimeError("animation_forward_velocity_similarity_exp received non-finite std")
+    if std_val <= 0.0:
+        print(f"[reward debug] animation_forward_velocity_similarity_exp: non-positive std: {std_val}")
+        raise RuntimeError("animation_forward_velocity_similarity_exp requires std > 0")
+    err_sq = torch.sum(torch.square(meas_yz - target_yz), dim=1)
+    out = torch.exp(-err_sq / (std_val ** 2))
+    if not torch.isfinite(out).all():
+        num_nan = torch.isnan(out).sum().item()
+        num_posinf = (out == float("inf")).sum().item()
+        num_neginf = (out == float("-inf")).sum().item()
+        print(f"[reward debug] animation_forward_velocity_similarity_exp: non-finite reward: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} err_sq_min={float(torch.nanmin(err_sq).item()) if err_sq.numel() > 0 else 'n/a'} err_sq_max={float(torch.nanmax(err_sq).item()) if err_sq.numel() > 0 else 'n/a'} std={std_val}")
+        raise RuntimeError("animation_forward_velocity_similarity_exp produced non-finite reward")
+    return out
+
+
+def animation_forward_velocity_similarity_world_exp(
+    env: ManagerBasedRLEnv,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Exponential tracking of world-frame XY linear velocity to animation target.
+
+    Uses metadata key 'base_forward_velocity_mps' to set target vx (world +x), with vy target fixed to 0.
+    reward = exp(- ( (vx_w - v_target)^2 + (vy_w - 0)^2 ) / std^2 )
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    anim = get_animation()
+    meta = anim.get("metadata", {}) or {}
+    if "base_forward_velocity_mps" not in meta or meta["base_forward_velocity_mps"] is None:
+        raise RuntimeError("Animation metadata is missing required key 'base_forward_velocity_mps'")
+    if meta["base_forward_velocity_mps"] <= 0.0:
+        raise RuntimeError("Animation metadata key 'base_forward_velocity_mps' is less than or equal to 0.0")
+    v_target = float(meta["base_forward_velocity_mps"])
+
+    # Measured base linear velocity in world frame XY order: [vx, vy]
+    vel_w = asset.data.root_lin_vel_w[:, :3]
+    if not torch.isfinite(vel_w).all():
+        num_nan = torch.isnan(vel_w).sum().item()
+        num_posinf = (vel_w == float("inf")).sum().item()
+        num_neginf = (vel_w == float("-inf")).sum().item()
+        print(f"[reward debug] animation_forward_velocity_similarity_world_exp: non-finite vel_w: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(vel_w.shape)}")
+        raise RuntimeError("animation_forward_velocity_similarity_world_exp encountered non-finite vel_w")
+    meas_xy = vel_w[:, [0, 1]]
+    target_xy = torch.tensor([v_target, 0.0], dtype=meas_xy.dtype, device=meas_xy.device)
+    # Validate std
+    try:
+        std_val = float(std)
+    except Exception:
+        print(f"[reward debug] animation_forward_velocity_similarity_world_exp: invalid std type: {type(std)} value={std}")
+        raise
+    if not torch.isfinite(torch.tensor(std_val, device=meas_xy.device, dtype=meas_xy.dtype)):
+        print(f"[reward debug] animation_forward_velocity_similarity_world_exp: non-finite std: {std_val}")
+        raise RuntimeError("animation_forward_velocity_similarity_world_exp received non-finite std")
+    if std_val <= 0.0:
+        print(f"[reward debug] animation_forward_velocity_similarity_world_exp: non-positive std: {std_val}")
+        raise RuntimeError("animation_forward_velocity_similarity_world_exp requires std > 0")
+    err_sq = torch.sum(torch.square(meas_xy - target_xy), dim=1)
+    out = torch.exp(-err_sq / (std_val ** 2))
+    if not torch.isfinite(out).all():
+        num_nan = torch.isnan(out).sum().item()
+        num_posinf = (out == float("inf")).sum().item()
+        num_neginf = (out == float("-inf")).sum().item()
+        print(f"[reward debug] animation_forward_velocity_similarity_world_exp: non-finite reward: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} err_sq_min={float(torch.nanmin(err_sq).item()) if err_sq.numel() > 0 else 'n/a'} err_sq_max={float(torch.nanmax(err_sq).item()) if err_sq.numel() > 0 else 'n/a'} std={std_val}")
+        raise RuntimeError("animation_forward_velocity_similarity_world_exp produced non-finite reward")
+    return out
 
 
 def track_lin_vel_yz_base_exp(
@@ -185,3 +389,125 @@ def align_projected_gravity_plus_x_l2(
     target = torch.tensor([1.0, 0.0, 0.0], dtype=g_b.dtype, device=g_b.device)
     dist_sq = torch.sum(torch.square(g_b - target), dim=1)
     return 1.0 - 0.5 * dist_sq
+
+
+def animation_contact_flags_mismatch_l1(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    label_groups: list[list[int]],
+    force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """L1 mismatch between animation contact flags and measured contacts.
+
+    - Expects the animation JSON to contain per-frame contact flags under key ``contact_flags``
+      shaped [T, K], with ordering described by ``metadata.contact.order``.
+    - ``label_groups`` must contain K groups, each being a list of indices into ``sensor_cfg.body_ids``
+      corresponding to the bodies that realize contact for that label (logical OR across the group).
+    - Measured contacts are computed from the contact sensor net forces with a force threshold.
+
+    Returns a per-env penalty equal to the sum over labels of |expected - measured| in [0, K].
+    """
+    # Retrieve expected contact flags and ordering from animation
+    anim = get_animation()
+    contact_flags = anim.get("contact_flags", None)
+    if contact_flags is None:
+        raise RuntimeError("Animation JSON is missing 'contact_flags'; cannot compute contact match reward")
+    contact_order = anim.get("contact_order", None)
+    if contact_order is None:
+        raise RuntimeError("Animation JSON is missing 'metadata.contact.order'; cannot align contact labels")
+
+    # Validate label groups length matches flags dimension
+    K = int(contact_flags.shape[1])
+    if len(label_groups) != K:
+        raise RuntimeError(
+            f"label_groups length {len(label_groups)} must match number of contact labels {K} from animation"
+        )
+
+    # Current frame index per env
+    _, frame_idx = compute_animation_phase_and_frame(env)
+
+    # Expected flags for each env at current frame
+    expected: torch.Tensor = contact_flags[frame_idx]  # [N, K], on GPU
+    if not torch.isfinite(expected).all():
+        num_nan = torch.isnan(expected).sum().item()
+        num_posinf = (expected == float("inf")).sum().item()
+        num_neginf = (expected == float("-inf")).sum().item()
+        print(f"[reward debug] animation_contact_flags_mismatch_l1: non-finite expected flags: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(expected.shape)}")
+        raise RuntimeError("animation_contact_flags_mismatch_l1 encountered non-finite expected flags")
+
+    # Measured contacts per body from sensor; produce [N, B] boolean
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    # net_forces_w_history: [N, H, B, 3] -> norm over xyz, max over history -> [N, B]
+    forces_hist = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+    forces_mag = forces_hist.norm(dim=-1)
+    if not torch.isfinite(forces_mag).all():
+        num_nan = torch.isnan(forces_mag).sum().item()
+        num_posinf = (forces_mag == float("inf")).sum().item()
+        num_neginf = (forces_mag == float("-inf")).sum().item()
+        print(f"[reward debug] animation_contact_flags_mismatch_l1: non-finite forces_mag: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(forces_mag.shape)}")
+        raise RuntimeError("animation_contact_flags_mismatch_l1 encountered non-finite forces magnitude from sensor")
+    contacts_per_body = (forces_mag.max(dim=1)[0] > float(force_threshold))  # [N, B]
+
+    # Aggregate per label group via OR across group members
+    N = contacts_per_body.shape[0]
+    measured = torch.zeros((N, K), dtype=expected.dtype, device=expected.device)
+    for k in range(K):
+        idxs = label_groups[k]
+        if not isinstance(idxs, (list, tuple)) or len(idxs) == 0:
+            raise RuntimeError(f"label_groups[{k}] must be a non-empty list of indices")
+        # Validate indices bounds against sensor_cfg.body_ids length
+        B = int(contacts_per_body.shape[1])
+        if any((int(i) < 0 or int(i) >= B) for i in idxs):
+            raise RuntimeError(f"label_groups[{k}] contains indices out of range for sensor body set of size {B}")
+        measured[:, k] = contacts_per_body[:, idxs].any(dim=1).to(dtype=expected.dtype)
+    if not torch.isfinite(measured).all():
+        num_nan = torch.isnan(measured).sum().item()
+        num_posinf = (measured == float("inf")).sum().item()
+        num_neginf = (measured == float("-inf")).sum().item()
+        print(f"[reward debug] animation_contact_flags_mismatch_l1: non-finite measured flags: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(measured.shape)}")
+        raise RuntimeError("animation_contact_flags_mismatch_l1 encountered non-finite measured flags")
+
+    # L1 mismatch per env
+    penalty = torch.sum(torch.abs(expected - measured), dim=1)
+    if not torch.isfinite(penalty).all():
+        num_nan = torch.isnan(penalty).sum().item()
+        num_posinf = (penalty == float("inf")).sum().item()
+        num_neginf = (penalty == float("-inf")).sum().item()
+        print(f"[reward debug] animation_contact_flags_mismatch_l1: non-finite penalty: NaN={num_nan} +Inf={num_posinf} -Inf={num_neginf} shape={tuple(penalty.shape)}")
+        raise RuntimeError("animation_contact_flags_mismatch_l1 produced non-finite penalty")
+    return penalty
+
+
+def animation_contact_flags_mismatch_feet_l1(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """Strict feet contact mismatch penalty using FL/FR/RL/RR ordering.
+
+    Requirements (fail loudly if violated):
+    - Animation must define contact_flags and metadata.contact.order == ["FL","FR","RL","RR"].
+    - Sensor entity must select exactly 4 bodies in the order [FL, FR, RL, RR].
+    """
+    anim = get_animation()
+    contact_order = anim.get("contact_order", None)
+    if contact_order is None:
+        raise RuntimeError("Animation missing contact_order; ensure metadata.contact.order is present")
+    expected_order = ["FL", "FR", "RL", "RR"]
+    if list(contact_order) != expected_order:
+        raise RuntimeError(
+            f"metadata.contact.order must be {expected_order}, got {list(contact_order)}"
+        )
+
+    # Validate sensor body selection count
+    # Note: We can't access names here, so rely on env config to pass bodies in required order.
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    # sensor_cfg.body_ids is resolved by managers; ensure 4 ids were selected
+    num_bodies = int(len(sensor_cfg.body_ids)) if hasattr(sensor_cfg, "body_ids") else -1
+    if num_bodies != 4:
+        raise RuntimeError(
+            f"sensor_cfg must select exactly 4 bodies in FL,FR,RL,RR order; got {num_bodies}"
+        )
+
+    label_groups = [[0], [1], [2], [3]]
+    return animation_contact_flags_mismatch_l1(env, sensor_cfg, label_groups, force_threshold=force_threshold)

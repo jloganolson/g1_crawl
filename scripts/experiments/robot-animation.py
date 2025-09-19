@@ -5,89 +5,27 @@ from isaaclab.app import AppLauncher
 app_launcher = AppLauncher(headless=False)
 simulation_app = app_launcher.app
 
-from g1_crawl.tasks.manager_based.g1_crawl.g1 import G1_CFG
+from g1_crawl.tasks.manager_based.g1_crawl.g1 import G1_CFG, get_animation, build_joint_index_map
 
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.assets import AssetBaseCfg
 import isaaclab.sim as sim_utils
 
 import torch
-import os
-import json
 
 # Add carb and omni for keyboard input handling
 import carb
 import omni
+from pxr import Usd, Sdf
+ALLOW_ROOT_WRITES = True
 
-
-def _default_animation_path():
-    return os.path.join(os.path.dirname(__file__), "animation_20250915_134944.json")
-
-
-def load_animation_json(device, json_path=None):
-    """Load animation JSON with timing, qpos and metadata."""
-    json_path = json_path or _default_animation_path()
-    if not os.path.exists(json_path):
-        raise FileNotFoundError(f"Animation JSON not found: {json_path}")
-
-    print(f"Loading animation JSON from: {json_path}")
-    with open(json_path, "r") as f:
-        data = json.load(f)
-
-    # timing: prefer dt, else derive from fps
-    if "dt" in data:
-        dt = float(data["dt"]) 
-    elif "fps" in data and data["fps"]:
-        dt = 1.0 / float(data["fps"]) 
-    else:
-        dt = 1.0 / 30.0
-
-    nq = int(data["nq"]) if "nq" in data else None
-
-    # frames: prefer 'qpos', else 'frames', else 'positions'
-    if "qpos" in data:
-        qpos_list = data["qpos"]
-    elif "frames" in data:
-        qpos_list = data["frames"]
-    elif "positions" in data:
-        qpos_list = data["positions"]
-    else:
-        raise KeyError("Animation JSON missing 'qpos' (or 'frames'/'positions') array")
-
-    T = len(qpos_list)
-    qpos_tensor = torch.tensor(qpos_list, dtype=torch.float32, device=device)
-    if nq is not None and qpos_tensor.shape[1] != nq:
-        print(f"[WARN] nq={nq} but qpos width={qpos_tensor.shape[1]}; using qpos width.")
-        nq = qpos_tensor.shape[1]
-    elif nq is None:
-        nq = qpos_tensor.shape[1]
-
-    metadata = data.get("metadata", {}) or {}
-    # qpos_labels may be located under metadata
-    qpos_labels = data.get("qpos_labels", None)
-    if qpos_labels is None:
-        qpos_labels = metadata.get("qpos_labels", None)
-
-    base_meta = metadata.get("base", None)
-    joints_meta = metadata.get("joints", {}) or {}
-
-    print(f"Loaded animation: T={T} frames, nq={nq}, dt={dt:.5f}")
-    if base_meta is not None:
-        print(f"metadata.base present: pos_indices={base_meta.get('pos_indices')} quat_indices={base_meta.get('quat_indices')}")
-    print(f"metadata.joints entries: {len(joints_meta)}")
-
-    return {
-        "dt": dt,
-        "nq": nq,
-        "qpos": qpos_tensor,
-        "qpos_labels": qpos_labels,
-        "metadata": metadata,
-        "base_meta": base_meta,
-        "joints_meta": joints_meta,
-        "num_frames": T,
-    }
-
-
+# Debug draw (3D overlays) availability
+try:
+    import isaacsim.util.debug_draw._debug_draw as omni_debug_draw  # type: ignore
+    _DEBUG_DRAW_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    omni_debug_draw = None  # type: ignore
+    _DEBUG_DRAW_AVAILABLE = False
 def create_scene_cfg():
     """Create a simple scene with ground, light, and the robot (free root)."""
     class SimpleSceneCfg(InteractiveSceneCfg):
@@ -98,6 +36,9 @@ def create_scene_cfg():
         Robot = G1_CFG.replace(
             prim_path="{ENV_REGEX_NS}/Robot",
             spawn=G1_CFG.spawn.replace(
+                rigid_props=G1_CFG.spawn.rigid_props.replace(
+                    disable_gravity=True
+                ),
                 articulation_props=G1_CFG.spawn.articulation_props.replace(
                     fix_root_link=False
                 )
@@ -123,71 +64,6 @@ def scene_reset(scene: InteractiveScene, anim=None, joint_index_map=None):
         scene["Robot"].write_joint_state_to_sim(joint_pos, joint_vel)
         print("Reset to default robot state")
     scene.reset()
-
-
-def build_joint_index_map(scene: InteractiveScene, joints_meta, qpos_labels):
-    """Build an index map from Isaac joint index -> qpos index using metadata.joints.
-
-    If a joint name is missing from metadata, optionally try to resolve via qpos_labels.
-    Returns a list of length num_robot_dofs where each entry is either an int qpos index or -1.
-    """
-    robot_joint_names = scene["Robot"].data.joint_names
-    index_map = []
-    missing = []
-
-    # Build name -> qposadr mapping from joints_meta
-    name_to_qposadr = {}
-    if isinstance(joints_meta, dict):
-        # older assumed format {name: qposadr}
-        for name, qposadr in joints_meta.items():
-            try:
-                name_to_qposadr[str(name)] = int(qposadr)
-            except Exception:
-                continue
-    elif isinstance(joints_meta, list):
-        # expected modern format: list of {name, type, qposadr, qposdim}
-        for item in joints_meta:
-            if not isinstance(item, dict):
-                continue
-            jname = item.get("name")
-            jtype = item.get("type")
-            adr = item.get("qposadr")
-            dim = item.get("qposdim", 1)
-            # Only map 1-dof joints (hinge/slide). Free joint is handled via base_meta.
-            if jname is not None and jtype in ("hinge", "slide") and isinstance(adr, int) and int(dim) == 1:
-                name_to_qposadr[str(jname)] = int(adr)
-
-    # Build label lookup for fallbacks
-    label_lookup = {}
-    if qpos_labels is not None:
-        for i, lbl in enumerate(qpos_labels):
-            s = str(lbl)
-            label_lookup[s] = i
-            # also allow matching without 'joint:' prefix
-            if s.startswith("joint:"):
-                label_lookup[s[len("joint:"):]] = i
-
-    for jn in robot_joint_names:
-        qidx = -1
-        if jn in name_to_qposadr:
-            qidx = name_to_qposadr[jn]
-        else:
-            # try labels: exact or with 'joint:' prefix
-            if jn in label_lookup:
-                qidx = label_lookup[jn]
-            elif ("joint:" + jn) in label_lookup:
-                qidx = label_lookup["joint:" + jn]
-        index_map.append(qidx)
-        if qidx == -1:
-            missing.append(jn)
-
-    if missing:
-        print(f"[WARN] Missing qpos indices for {len(missing)} joints (will keep defaults): {missing}")
-    else:
-        print("Joint index map: all joints mapped successfully.")
-    return index_map
-
-
 def apply_animation_frame(scene: InteractiveScene, anim, frame_idx, joint_index_map=None):
     """Apply one animation frame from the JSON to the robot."""
     qpos_row = anim["qpos"][frame_idx]
@@ -201,10 +77,11 @@ def apply_animation_frame(scene: InteractiveScene, anim, frame_idx, joint_index_
         if pos_idx is not None and quat_idx is not None:
             base_pos = qpos_row[pos_idx]
             wxyz = qpos_row[quat_idx]
-            # Per g1_joint_debug.py, Isaac expects [w, x, y, z] in data and when writing
-            # root pose; thus, use [w,x,y,z] directly from JSON.
+            # Normalize quaternion to avoid backend rejection
+            qwxyz_norm = torch.linalg.norm(wxyz)
+            if qwxyz_norm > 0:
+                wxyz = wxyz / qwxyz_norm
             new_root_state = torch.zeros(1, 13, device=device)
-            # Add env origin offset to base position
             origin = scene.env_origins.to(device=device)[0] if hasattr(scene, 'env_origins') else torch.zeros(3, device=device)
             new_root_state[0, :3] = base_pos + origin
             new_root_state[0, 3:7] = wxyz
@@ -225,22 +102,23 @@ def apply_animation_frame(scene: InteractiveScene, anim, frame_idx, joint_index_
         if isinstance(qidx, (int,)) and qidx >= 0 and qidx < anim["nq"]:
             joint_positions[0, j_idx] = qpos_row[qidx]
 
-    scene["Robot"].set_joint_position_target(joint_positions)
-    scene["Robot"].set_joint_velocity_target(joint_velocities)
+    # Write states directly to sim (no PD targets) for physics-free playback
+    scene["Robot"].write_joint_state_to_sim(joint_positions, joint_velocities)
     scene.write_data_to_sim()
+
 
 
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     """Run the simulator with JSON animation playback."""
-    # Load JSON animation (fail loudly if invalid)
-    anim = load_animation_json(scene["Robot"].device)
+    # Load JSON animation via shared helper (fails loudly if invalid)
+    anim = get_animation()
 
     sim_dt = sim.get_physics_dt()
     print(f"Simulation dt: {sim_dt:.4f}s")
     sim_time = 0.0
 
-    # Build joint index map
-    joint_index_map = build_joint_index_map(scene, anim["joints_meta"], anim.get("qpos_labels"))
+    # Build joint index map using shared helper (pass articulation asset)
+    joint_index_map = build_joint_index_map(scene["Robot"], anim["joints_meta"], anim.get("qpos_labels"))
 
     # Animation state
     frame_idx = 0
@@ -250,6 +128,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
     # Reset to first frame
     scene_reset(scene, anim, joint_index_map)
+
     
     # Set up keyboard input handling
     input_interface = carb.input.acquire_input_interface()
@@ -346,6 +225,164 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Subscribe to keyboard events
     keyboard_subscription = input_interface.subscribe_to_keyboard_events(keyboard, on_keyboard_event)
     
+    # ===== Contact flags 3D visualization (feet/hands) =====
+    def _require_debug_draw():
+        if not _DEBUG_DRAW_AVAILABLE:
+            raise RuntimeError("Debug draw is not available. Ensure visualization mode and debug_draw extension are enabled.")
+
+    def _find_first_match(name_list, patterns):
+        lname = [str(n).lower() for n in name_list]
+        for p in patterns:
+            pl = p.lower()
+            for i, n in enumerate(lname):
+                if pl in n:
+                    return i
+        return None
+
+    def _find_limb_body_indices(asset):
+        names = asset.data.body_names
+        name_to_idx = {str(n): i for i, n in enumerate(names)}
+
+        # Prefer exact known names from env cfg
+        preferred = {
+            "left_foot": "left_ankle_roll_link",
+            "right_foot": "right_ankle_roll_link",
+            "left_hand": "left_wrist_link",
+            "right_hand": "right_wrist_link",
+        }
+
+        resolved: dict[str, int | None] = {k: None for k in preferred.keys()}
+        used_fallback: dict[str, bool] = {k: False for k in preferred.keys()}
+
+        for limb, exact_name in preferred.items():
+            if exact_name in name_to_idx:
+                resolved[limb] = int(name_to_idx[exact_name])
+                print(f"[contacts] {limb} -> '{exact_name}' (index {resolved[limb]}) [exact]")
+            else:
+                # Heuristic substring fallback
+                patterns = []
+                if limb == "left_foot":
+                    patterns = ["left_ankle", "left_foot", "l_ankle", "l_foot", "left_toe", "left_sole"]
+                elif limb == "right_foot":
+                    patterns = ["right_ankle", "right_foot", "r_ankle", "r_foot", "right_toe", "right_sole"]
+                elif limb == "left_hand":
+                    patterns = ["left_wrist", "left_hand", "l_wrist", "l_hand", "left_palm"]
+                elif limb == "right_hand":
+                    patterns = ["right_wrist", "right_hand", "r_wrist", "r_hand", "right_palm"]
+                idx = _find_first_match(names, patterns)
+                if idx is not None:
+                    used_fallback[limb] = True
+                    resolved[limb] = int(idx)
+                    print(f"[contacts] {limb} -> '{names[int(idx)]}' (index {idx}) [fallback-substr]")
+
+        missing = [k for k, v in resolved.items() if v is None]
+        if missing:
+            print(f"[contacts] Available bodies ({len(names)}): {list(names)}")
+            raise RuntimeError(f"Could not locate bodies for: {missing}. Prefer exact names from env cfg.")
+
+        return {k: int(v) for k, v in resolved.items() if v is not None}
+
+    def _resolve_contact_label_indices(contact_order):
+        # Normalize
+        order_raw = list(contact_order)
+        order = [str(x).strip().lower() for x in order_raw]
+
+        # First prefer canonical FL/FR/RL/RR
+        try_map: dict[str, list[str]] = {
+            "left_hand": ["fl", "front_left"],
+            "right_hand": ["fr", "front_right"],
+            "left_foot": ["rl", "rear_left", "back_left"],
+            "right_foot": ["rr", "rear_right", "back_right"],
+        }
+
+        indices: dict[str, int | None] = {k: None for k in try_map.keys()}
+        for limb, keys in try_map.items():
+            for key in keys:
+                for i, s in enumerate(order):
+                    if s == key:
+                        indices[limb] = i
+                        break
+                if indices[limb] is not None:
+                    break
+
+        # Fallback: broader synonyms inside strings
+        def find_fuzzy(candidates):
+            for i, s in enumerate(order):
+                for c in candidates:
+                    if c in s:
+                        return i
+            return None
+
+        if indices["left_hand"] is None:
+            indices["left_hand"] = find_fuzzy(["left_hand", "l_hand", "left_wrist", "l_wrist"])
+        if indices["right_hand"] is None:
+            indices["right_hand"] = find_fuzzy(["right_hand", "r_hand", "right_wrist", "r_wrist"])
+        if indices["left_foot"] is None:
+            indices["left_foot"] = find_fuzzy(["left_foot", "l_foot", "left_toe", "l_toe", "left_ankle"])
+        if indices["right_foot"] is None:
+            indices["right_foot"] = find_fuzzy(["right_foot", "r_foot", "right_toe", "r_toe", "right_ankle"])
+
+        missing = [k for k, v in indices.items() if v is None]
+        if missing:
+            raise RuntimeError(
+                f"Animation contact_order missing required entries for {missing}. Found: {order_raw}"
+            )
+
+        print(
+            "[contacts] contact_order mapping:",
+            {
+                "left_hand": order_raw[int(indices["left_hand"])],
+                "right_hand": order_raw[int(indices["right_hand"])],
+                "left_foot": order_raw[int(indices["left_foot"])],
+                "right_foot": order_raw[int(indices["right_foot"])],
+            },
+        )
+        return {k: int(v) for k, v in indices.items() if v is not None}
+
+    # Prepare mapping once
+    _require_debug_draw()
+    contact_order = anim.get("contact_order", None)
+    if contact_order is None:
+        raise RuntimeError("Animation JSON missing 'metadata.contact.order' for contact visualization")
+    label_indices = _resolve_contact_label_indices(contact_order)
+    body_indices = _find_limb_body_indices(scene["Robot"])
+    print(
+        "[contacts] body mapping:",
+        {
+            k: {
+                "name": str(scene["Robot"].data.body_names[v]),
+                "index": int(v),
+            }
+            for k, v in body_indices.items()
+        },
+    )
+
+    draw_interface = omni_debug_draw.acquire_debug_draw_interface()
+
+    def draw_contact_flags(frame_index: int):
+        flags = anim.get("contact_flags", None)
+        if flags is None:
+            raise RuntimeError("Animation JSON missing 'contact_flags' for contact visualization")
+        # Build points and colors
+        pts = []
+        colors = []
+        sizes = []
+        # Fetch current world positions (single env index 0)
+        body_pos_w = scene["Robot"].data.body_pos_w[0]
+        z_offset = 0.03
+        for limb_name in ["left_hand", "right_hand", "left_foot", "right_foot"]:
+            bidx = body_indices[limb_name]
+            lidx = label_indices[limb_name]
+            p = body_pos_w[bidx]
+            contact_val = float(flags[frame_index, lidx].item())
+            color = (0.1, 0.9, 0.1, 1.0) if contact_val >= 0.5 else (0.9, 0.1, 0.1, 1.0)
+            pts.append((float(p[0].item()), float(p[1].item()), float(p[2].item() + z_offset)))
+            colors.append(color)
+            sizes.append(16)
+        # Clear and draw
+        draw_interface.clear_points()
+        draw_interface.draw_points(pts, colors, sizes)
+
     print(f"Starting animation playback...")
     print(f"Simulation dt: {sim_dt:.4f}s, Animation dt: {anim_dt:.4f}s")
     print(f"Controls:")
@@ -369,6 +406,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             # Always apply current frame to keep articulation stable
             if frame_idx < anim["num_frames"]:
                 apply_animation_frame(scene, anim, frame_idx, joint_index_map)
+                # Draw contact flags at current frame
+                draw_contact_flags(frame_idx)
             
             # Advance frame only if not paused and not in manual stepping mode
             if not paused and not manual_stepping and sim_time - last_frame_time >= anim_dt:

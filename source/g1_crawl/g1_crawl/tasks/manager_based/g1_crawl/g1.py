@@ -199,8 +199,7 @@ def _default_animation_path() -> str:
     # # Compute repo root from this file
     this_dir = os.path.dirname(__file__)
     repo_root = os.path.abspath(os.path.join(this_dir, "../../../../../../"))
-    # candidate = os.path.join(repo_root, "scripts/experiments/animation_20250915_134944.json")
-    candidate = os.path.join(repo_root, "assets/animation_rc1.json")
+    candidate = os.path.join(repo_root, "assets/animation_rc3.json")
 
     return candidate
 
@@ -297,6 +296,35 @@ def load_animation_json(json_path: str | None = None) -> dict:
             except Exception:
                 site_positions_tensor = None
 
+    # Required per-frame contact flags: [T, K] with order specified in metadata.contact.order
+    if "contact_flags" not in data or data["contact_flags"] is None:
+        raise RuntimeError("Animation JSON missing required 'contact_flags' array")
+    cf_list = data["contact_flags"]
+    cf_tensor = torch.tensor(cf_list, dtype=torch.float32, device="cpu")
+    if cf_tensor.ndim != 2 or int(cf_tensor.shape[0]) != int(T):
+        raise RuntimeError("contact_flags must be a 2D array with shape [T, K] matching frame count T")
+    if not isinstance(metadata, dict) or "contact" not in metadata or metadata["contact"] is None:
+        raise RuntimeError("Animation JSON missing required 'metadata.contact' block")
+    contact_meta = metadata["contact"]
+    if not isinstance(contact_meta, dict):
+        raise RuntimeError("metadata.contact must be a dict")
+    if "order" not in contact_meta or contact_meta["order"] is None:
+        raise RuntimeError("metadata.contact.order is required and must list contact labels")
+    contact_order = contact_meta["order"]
+    if not isinstance(contact_order, (list, tuple)) or len(contact_order) == 0:
+        raise RuntimeError("metadata.contact.order must be a non-empty list")
+    if int(cf_tensor.shape[1]) != int(len(contact_order)):
+        raise RuntimeError(
+            f"contact_flags column count {int(cf_tensor.shape[1])} does not match metadata.contact.order length {int(len(contact_order))}"
+        )
+    if "threshold_m" not in contact_meta or contact_meta["threshold_m"] is None:
+        raise RuntimeError("metadata.contact.threshold_m is required")
+    try:
+        contact_threshold_m = float(contact_meta["threshold_m"])
+    except Exception:
+        raise RuntimeError("metadata.contact.threshold_m must be a float")
+    contact_flags_tensor = cf_tensor
+
     # Normalize base world x/y so the animation starts at the origin.
     # If base position indices are provided, subtract the first frame's x/y from all frames.
     if base_meta is not None:
@@ -314,6 +342,18 @@ def load_animation_json(json_path: str | None = None) -> dict:
                     site_positions_tensor[:, :, 0] -= x0
                     site_positions_tensor[:, :, 1] -= y0
 
+    # Move tensors to GPU for runtime use (fail loudly if CUDA not available)
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for animation tensors; no GPU available")
+    device = torch.device("cuda")
+    qpos_tensor = qpos_tensor.to(device)
+    if qvel_tensor is not None:
+        qvel_tensor = qvel_tensor.to(device)
+    if site_positions_tensor is not None:
+        site_positions_tensor = site_positions_tensor.to(device)
+    if contact_flags_tensor is not None:
+        contact_flags_tensor = contact_flags_tensor.to(device)
+
     return {
         "dt": float(dt),
         "nq": int(nq),
@@ -328,6 +368,153 @@ def load_animation_json(json_path: str | None = None) -> dict:
         "nsite": int(nsite),
         "site_positions": site_positions_tensor,
         "sites_meta": sites_meta,
+        "contact_flags": contact_flags_tensor if contact_flags_tensor is not None else None,
+        "contact_order": list(contact_order) if contact_order is not None else None,
+        "contact_threshold_m": float(contact_threshold_m) if contact_threshold_m is not None else None,
         "num_frames": int(T),
         "json_path": path,
     }
+
+
+# ===== Animation helpers (moved from events.py) =====
+from isaaclab.assets import Articulation  # type: ignore  # for type hints
+
+_ANIM_CACHE: dict | None = None
+
+
+def get_animation(json_path: str | None = None) -> dict:
+    """Return cached animation dict; loads once via load_animation_json."""
+    global _ANIM_CACHE
+    if _ANIM_CACHE is None:
+        _ANIM_CACHE = load_animation_json(json_path)
+    return _ANIM_CACHE
+
+
+def build_joint_index_map(asset: Articulation, joints_meta, qpos_labels):
+    robot_joint_names = asset.data.joint_names
+    index_map: list[int] = []
+    missing: list[str] = []
+
+    name_to_qposadr: dict[str, int] = {}
+    if isinstance(joints_meta, dict):
+        for name, qposadr in joints_meta.items():
+            try:
+                name_to_qposadr[str(name)] = int(qposadr)
+            except Exception:
+                continue
+    elif isinstance(joints_meta, list):
+        for item in joints_meta:
+            if not isinstance(item, dict):
+                continue
+            jname = item.get("name")
+            jtype = item.get("type")
+            adr = item.get("qposadr")
+            dim = item.get("qposdim", 1)
+            if jname is not None and jtype in ("hinge", "slide") and isinstance(adr, int) and int(dim) == 1:
+                name_to_qposadr[str(jname)] = int(adr)
+
+    label_lookup: dict[str, int] = {}
+    if qpos_labels is not None:
+        for i, lbl in enumerate(qpos_labels):
+            s = str(lbl)
+            label_lookup[s] = i
+            if s.startswith("joint:"):
+                label_lookup[s[len("joint:"):]] = i
+
+    for jn in robot_joint_names:
+        qidx = -1
+        if jn in name_to_qposadr:
+            qidx = name_to_qposadr[jn]
+        else:
+            if jn in label_lookup:
+                qidx = label_lookup[jn]
+            elif ("joint:" + jn) in label_lookup:
+                qidx = label_lookup["joint:" + jn]
+        index_map.append(qidx)
+        if qidx == -1:
+            missing.append(jn)
+
+    if missing:
+        print(f"[WARN] Missing qpos indices for {len(missing)} joints (will keep defaults)")
+    return index_map
+
+
+def build_joint_velocity_index_map(asset: Articulation, joints_meta, qvel_labels, qpos_labels=None):
+    """Build per-joint mapping into the animation's qvel vector.
+
+    Preference order per joint:
+    1) joints_meta.qveladr if provided
+    2) joints_meta.qposadr (hinge/slide 1-DoF often match)
+    3) label lookup in qvel_labels
+    4) fallback to qpos label lookup
+    """
+    robot_joint_names = asset.data.joint_names
+    index_map: list[int] = []
+    missing: list[str] = []
+
+    name_to_qveladr: dict[str, int] = {}
+    if isinstance(joints_meta, dict):
+        for name, adr in joints_meta.items():
+            try:
+                # Allow either qveladr directly or legacy qposadr
+                if isinstance(adr, dict):
+                    if "qveladr" in adr and isinstance(adr["qveladr"], int):
+                        name_to_qveladr[str(name)] = int(adr["qveladr"])  # type: ignore[index]
+                    elif "qposadr" in adr and isinstance(adr["qposadr"], int):
+                        name_to_qveladr[str(name)] = int(adr["qposadr"])  # type: ignore[index]
+                else:
+                    name_to_qveladr[str(name)] = int(adr)
+            except Exception:
+                continue
+    elif isinstance(joints_meta, list):
+        for item in joints_meta:
+            if not isinstance(item, dict):
+                continue
+            jname = item.get("name")
+            jtype = item.get("type")
+            vadr = item.get("qveladr")
+            padr = item.get("qposadr")
+            vdim = item.get("qveldim", 1)
+            pdim = item.get("qposdim", 1)
+            # Only 1-DoF joints are considered here
+            if (
+                jname is not None
+                and jtype in ("hinge", "slide")
+                and ((isinstance(vadr, int) and int(vdim) == 1) or (isinstance(padr, int) and int(pdim) == 1))
+            ):
+                if isinstance(vadr, int) and int(vdim) == 1:
+                    name_to_qveladr[str(jname)] = int(vadr)
+                elif isinstance(padr, int) and int(pdim) == 1:
+                    name_to_qveladr[str(jname)] = int(padr)
+
+    # Label lookup from qvel labels, with fallback to qpos labels
+    label_lookup: dict[str, int] = {}
+    if qvel_labels is not None:
+        for i, lbl in enumerate(qvel_labels):
+            s = str(lbl)
+            label_lookup[s] = i
+            if s.startswith("joint:"):
+                label_lookup[s[len("joint:"):]] = i
+    if not label_lookup and qpos_labels is not None:
+        for i, lbl in enumerate(qpos_labels):
+            s = str(lbl)
+            label_lookup[s] = i
+            if s.startswith("joint:"):
+                label_lookup[s[len("joint:"):]] = i
+
+    for jn in robot_joint_names:
+        qidx = -1
+        if jn in name_to_qveladr:
+            qidx = name_to_qveladr[jn]
+        else:
+            if jn in label_lookup:
+                qidx = label_lookup[jn]
+            elif ("joint:" + jn) in label_lookup:
+                qidx = label_lookup["joint:" + jn]
+        index_map.append(qidx)
+        if qidx == -1:
+            missing.append(jn)
+
+    if missing:
+        print(f"[WARN] Missing qvel indices for {len(missing)} joints (will keep default zeros)")
+    return index_map

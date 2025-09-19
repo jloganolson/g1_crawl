@@ -1,7 +1,8 @@
 ---
-description:
+description: Best practices
 globs:
-alwaysApply: false
+alwaysApply: true
 ---
 
-Whenever running python in this project, use the `g1-crawl` conda env (e.g. `conda activate g1-crawl && python test.py`)
+- Whenever running python in this project, use the `g1-crawl` conda env (e.g. `conda activate g1-crawl && python test.py`)
+- Do not code quiet failure/backup cases (e.g. try/catch or `if x is None`) - we'd rather fail loudly

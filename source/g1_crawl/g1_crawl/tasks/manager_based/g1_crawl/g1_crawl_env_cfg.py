@@ -3,12 +3,12 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-import math
+import torch
 from dataclasses import MISSING
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
-from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.envs import ManagerBasedRLEnvCfg, ManagerBasedRLEnv
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -35,7 +35,6 @@ from .g1 import G1_CFG
 
 @configclass
 class G1CrawlSceneCfg(InteractiveSceneCfg):
-    """Configuration for a cart-pole scene."""
   # ground terrain
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
@@ -78,41 +77,26 @@ class G1CrawlSceneCfg(InteractiveSceneCfg):
     )
 
 
-@configclass
-class CommandsCfg:
-    """Command specifications for the MDP."""
+# @configclass
+# class CommandsCfg:
+#     """Command specifications for the MDP."""
 
-    base_velocity = mdp.CrawlVelocityCommandCfg(
-        asset_name="robot",
-        resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.1,
-        rel_heading_envs=1.0,
-        heading_command=False,
-        heading_control_stiffness=0.5,
-        debug_vis=True,
-        ranges=mdp.CrawlVelocityCommandCfg.Ranges(
-            heading=(0.0,0.0),
-            # Crawling fields used by the command implementation
-            lin_vel_z=(0, 1.0),
-            lin_vel_y=(0.,0.),
-            ang_vel_x=(-1.0, 1.0)
-        )
-    )
-
-
-    # base_velocity = mdp.UniformVelocityCommandCfg(
-    #     asset_name="robot",
-    #     resampling_time_range=(10.0, 10.0),
-    #     rel_standing_envs=0.02,
-    #     rel_heading_envs=1.0,
-    #     heading_command=True,
-    #     heading_control_stiffness=0.5,
-    #     debug_vis=True,
-    #     ranges=mdp.UniformVelocityCommandCfg.Ranges(
-    #         lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
-    #     ),
-    # )
-
+#     base_velocity = mdp.CrawlVelocityCommandCfg(
+#         asset_name="robot",
+#         resampling_time_range=(10.0, 10.0),
+#         rel_standing_envs=0.1,
+#         rel_heading_envs=1.0,
+#         heading_command=False,
+#         heading_control_stiffness=0.5,
+#         debug_vis=True,
+#         ranges=mdp.CrawlVelocityCommandCfg.Ranges(
+#             heading=(0.0,0.0),
+#             # Crawling fields used by the command implementation
+#             lin_vel_z=(0, 1.0),
+#             lin_vel_y=(0.,0.),
+#             ang_vel_x=(-1.0, 1.0)
+#         )
+#     )
 
 
 @configclass
@@ -133,10 +117,11 @@ class ObservationsCfg:
             func=mdp.projected_gravity,
             noise=Unoise(n_min=-0.05, n_max=0.05),
         )
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+        # velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
-        actions = ObsTerm(func=mdp.last_action)
+        actions = ObsTerm(func=mdp.last_action_with_log)
+        phase = ObsTerm(func=mdp.animation_phase)
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -152,10 +137,11 @@ class ObservationsCfg:
         projected_gravity = ObsTerm(
             func=mdp.projected_gravity,
         )
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+        # velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        actions = ObsTerm(func=mdp.last_action)
+        actions = ObsTerm(func=mdp.last_action_with_log)
+        phase = ObsTerm(func=mdp.animation_phase)
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -182,6 +168,13 @@ class EventCfg:
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
+    )
+
+    # Ensure animation phase offsets are initialized for observations before any reset
+    init_anim_phase = EventTerm(
+        func=mdp.init_animation_phase_offsets,
+        mode="startup",
+        params={},
     )
 
     # Scale all link masses: *U(0.9, 1.1) - matching MuJoCo rand_dynamics
@@ -246,6 +239,24 @@ class EventCfg:
     # )
 
     # interval
+    # viz_anim_sites = EventTerm(
+    #     func=mdp.viz_animation_sites_step,
+    #     mode="interval",
+    #     interval_range_s=(0.0,0.0),
+    #     params={
+    #         "max_envs": 32,
+    #         "asset_cfg": SceneEntityCfg("robot"),
+    #     },
+    # )
+    # viz_base_step = EventTerm(
+    #     func=mdp.viz_base_positions_step,
+    #     mode="interval",
+    #     interval_range_s=(0.0, 0.0),
+    #     params={
+    #         "max_envs": 32,
+    #         "asset_cfg": SceneEntityCfg("robot"),
+    #     },
+    # )
     # push_robot = EventTerm(
     #     func=mdp.push_by_setting_velocity_with_viz,
     #     mode="interval",
@@ -265,34 +276,34 @@ class RewardsCfg:
     # ang_vel_l2 = RewTerm(func=mdp.ang_vel_l2, weight=-5.0)
 
     #follow commands (base YZ plane and roll about X)
-    track_lin_vel_yz_exp = RewTerm(
-        func=mdp.track_lin_vel_yz_base_exp,
-        weight=2.0,
-        params={"command_name": "base_velocity", "std": 0.5},
-    )
-    track_ang_vel_x_exp = RewTerm(
-        func=mdp.track_ang_vel_x_world_exp, weight=2.0, params={"command_name": "base_velocity", "std": 0.5}
-    )
-    flat_orientation_l2 = RewTerm(func=mdp.align_projected_gravity_plus_x_l2, weight=1.0)
+    # track_lin_vel_yz_exp = RewTerm(
+    #     func=mdp.track_lin_vel_yz_base_exp,
+    #     weight=2.0,
+    #     params={"command_name": "base_velocity", "std": 0.5},
+    # )
+    # track_ang_vel_x_exp = RewTerm(
+    #     func=mdp.track_ang_vel_x_world_exp, weight=2.0, params={"command_name": "base_velocity", "std": 0.5}
+    # )
+    # flat_orientation_l2 = RewTerm(func=mdp.align_projected_gravity_plus_x_l2, weight=1.0)
     
     
     # termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
     
     
-    base_height_l2 = RewTerm(
-        func=mdp.base_height_l2,
-        weight=-.1,
-        params={
-            "target_height": 0.22,
-            "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
-        },
-    )
+    # base_height_l2 = RewTerm(
+    #     func=mdp.base_height_l2,
+    #     weight=-.1,
+    #     params={
+    #         "target_height": 0.22,
+    #         "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
+    #     },
+    # )
 
-    joint_deviation_all = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.1,
-        params={"asset_cfg": SceneEntityCfg("robot")},
-    )
+    # joint_deviation_all = RewTerm(
+    #     func=mdp.joint_deviation_l1,
+    #     weight=-0.1,
+    #     params={"asset_cfg": SceneEntityCfg("robot")},
+    # )
     
     #limits
     dof_pos_limits = RewTerm(
@@ -330,14 +341,46 @@ class RewardsCfg:
         },
     )
 
-    feet_air_time = RewTerm(
-        func=mdp.feet_air_time,
-        weight=0.05,
+    # feet_air_time = RewTerm(
+    #     func=mdp.feet_air_time,
+    #     weight=0.05,
+    #     params={
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
+    #         "command_name": "base_velocity",
+    #         "threshold": 0.5,
+    #     },
+    # )
+
+    # Animation-tracking rewards (initial small weights)
+    anim_pose_l1 = RewTerm(
+        func=mdp.animation_pose_similarity_l1,
+        weight=-2.0,
+    )
+
+    # Contact pattern tracking from animation (strict): FL, FR, RL, RR must match
+    # Requires contact sensor to expose bodies in this order; we pass explicit names.
+    anim_contact_mismatch_l1 = RewTerm(
+        func=mdp.animation_contact_flags_mismatch_feet_l1,
+        weight=-1.0,
         params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link", ".*_wrist_link"]),
-            "command_name": "base_velocity",
-            "threshold": 0.5,
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=[
+                    "left_wrist_link",        # FL 
+                    "right_wrist_link",       # FR 
+                    "left_ankle_roll_link",   # RL
+                    "right_ankle_roll_link",  # RR
+                ],
+            ),
+            # Use a reasonable force threshold to detect contact from sensor
+            "force_threshold": 1.0,
         },
+    )
+
+    anim_forward_vel = RewTerm(
+        func=mdp.animation_forward_velocity_similarity_world_exp,
+        weight=1.,
+        params={"std": 1.0},  # Increased from 0.5 to soften the exponential curve
     )
 
 
@@ -351,23 +394,29 @@ class TerminationsCfg:
     #     params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
     # )
 
-@configclass
-class CurriculumCfg:
-    """Curriculum terms for the MDP."""
-    push_magnitude = CurrTerm(
-        func=mdp.modify_event_parameter, params={"num_steps": 8000}
-    )
+# @configclass
+# class CurriculumCfg:
+#     """Curriculum terms for the MDP."""
+#     push_magnitude = CurrTerm(
+#         func=mdp.modify_event_parameter, params={"num_steps": 8000}
+#     )
 
     # self.events.push_robot.params params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}}
+
+# class G1CrawlEnv(ManagerBasedRLEnv):
+#     def __init__(self, cfg: object, **kwargs):
+#         super().__init__(cfg, **kwargs)
+#         self._anim_phase_offset = torch.zeros(self.num_envs, device=self.device, dtype=torch.float3)
 
 
 @configclass
 class G1CrawlEnvCfg(ManagerBasedRLEnvCfg):
+    # env_class: type = G1CrawlEnv
     # Scene settings
     scene: G1CrawlSceneCfg = G1CrawlSceneCfg(num_envs=4096, env_spacing=4.0)
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
-    commands: CommandsCfg = CommandsCfg()
+    # commands: CommandsCfg = CommandsCfg()
 
     # MDP settings
     rewards: RewardsCfg = RewardsCfg()
@@ -375,9 +424,14 @@ class G1CrawlEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
     # curriculum: CurriculumCfg = CurriculumCfg()
 
+    # def __init__(self, *args, **kwargs):
+    #     super().__init__(*args, **kwargs)
+    #     self.animation_phase_offset = 0.0
+
 
     def __post_init__(self) -> None:
         """Post initialization."""
+
         # general settings
         self.decimation = 4
         self.episode_length_s = 20.0
