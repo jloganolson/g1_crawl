@@ -380,7 +380,7 @@ class RewardsCfg:
     anim_forward_vel = RewTerm(
         func=mdp.animation_forward_velocity_similarity_exp,
         weight=2.,
-        params={"std": 0.5},
+        params={"std": 1.0},  # Increased from 0.5 to soften the exponential curve
     )
 
 

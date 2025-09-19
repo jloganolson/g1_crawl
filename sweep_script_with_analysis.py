@@ -8,7 +8,7 @@ from datetime import datetime
 
 
 # Experiment configuration
-EXPERIMENT_NAME = "g1_crawl_sweep_v1"  # Must match cfg 
+EXPERIMENT_NAME = "g1_crawl_sweep_v2"  # Must match cfg 
 START_FROM_RUN = 1  # Set to 1 to start from beginning, or higher to resume from a specific run
 
 # =============================================================================
@@ -114,24 +114,25 @@ def run_command(command_args, description="Running command", prefix=None, log_fi
             print(f"\nError: {error_msg}")
             if log_file and run_number and total_runs and combination:
                 log_parameter_combination(combination, run_number, total_runs, log_file, status="FAILED", error=error_msg, command_type=command_type, full_command=command_args)
-            exit(1) # Exit if a command fails
+            return False
         else:
             print("\nCommand completed successfully.")
             if log_file and run_number and total_runs and combination:
                 log_parameter_combination(combination, run_number, total_runs, log_file, status="COMPLETED", command_type=command_type, full_command=command_args)
+            return True
 
     except FileNotFoundError:
         error_msg = f"Command not found. Make sure '{command_args[0]}' is in your PATH or correctly specified."
         print(f"Error: {error_msg}")
         if log_file and run_number and total_runs and combination:
             log_parameter_combination(combination, run_number, total_runs, log_file, status="FAILED", error=error_msg, command_type=command_type, full_command=command_args)
-        exit(1)
+        return False
     except Exception as e:
         error_msg = f"An unexpected error occurred: {e}"
         print(f"Error: {error_msg}")
         if log_file and run_number and total_runs and combination:
             log_parameter_combination(combination, run_number, total_runs, log_file, status="FAILED", error=error_msg, command_type=command_type, full_command=command_args)
-        exit(1)
+        return False
 
 def main():
     # Define base commands - updated to use EXPERIMENT_NAME
@@ -140,7 +141,9 @@ def main():
 
     # Create log file with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = f"sweep_log_{EXPERIMENT_NAME}_{timestamp}.txt"
+    log_dir = "sweep-logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"sweep_log_{EXPERIMENT_NAME}_{timestamp}.txt")
     
     # Write header to log file
     with open(log_file, 'w') as f:
@@ -185,12 +188,17 @@ def main():
 
         # Construct the full train command
         full_train_cmd = TRAIN_BASE_CMD + train_args
-        run_command(full_train_cmd, f"Training for {description}", prefix=run_prefix, 
+        train_ok = run_command(full_train_cmd, f"Training for {description}", prefix=run_prefix, 
                    log_file=log_file, run_number=i+1, total_runs=len(parameter_combinations), 
                    combination=combination, command_type="TRAIN")
 
         # Construct the full play command (no extra args needed for play usually)
         full_play_cmd = PLAY_BASE_CMD
+        if not train_ok:
+            # Skip play if training failed, but log it explicitly
+            log_parameter_combination(combination, i+1, len(parameter_combinations), log_file, status="SKIPPED", command_type="PLAY", full_command=full_play_cmd)
+            continue
+
         run_command(full_play_cmd, f"Playing for {description}", prefix=run_prefix,
                    log_file=log_file, run_number=i+1, total_runs=len(parameter_combinations),
                    combination=combination, command_type="PLAY")
