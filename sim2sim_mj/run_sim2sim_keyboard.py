@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Standalone policy deployment using only standard MuJoCo (no mjlab).
+This version includes keyboard control support.
 
 This script runs trained policies using exported MJCF, requiring only:
 - mujoco
 - torch
 - numpy
 - glfw (for gamepad support)
+- pynput (for keyboard support)
 
 Run export_mjcf.py first to generate the scene XML file.
 
 USAGE:
 1. Edit the CONFIG section below with your desired settings
-2. Run: python deploy_standalone.py
+2. Run: python run_sim2sim_keyboard.py
 """
 
 import json
@@ -27,8 +29,14 @@ import mujoco
 import mujoco.viewer as viewer
 import numpy as np
 import torch
-import threading
-from pynput import keyboard
+
+# Try to import pynput library for cross-platform keyboard input (no root required on Linux)
+try:
+    from pynput import keyboard as pynput_keyboard
+    KEYBOARD_AVAILABLE = True
+except ImportError:
+    KEYBOARD_AVAILABLE = False
+    pynput_keyboard = None
 
 
 # ============================================================================
@@ -54,16 +62,13 @@ CONFIG = {
     # Path to JSON file with initial pose (or None to use default)
     "init_pose_json": "poses/default-pose.json",
     
-    # === GAMEPAD SETTINGS ===
+    # === INPUT SETTINGS ===
     
     # Enable gamepad control (requires glfw)
-    # Set to False if you only have keyboard (robot will hold pose)
-    "use_gamepad": False,
+    # If False or gamepad not found, falls back to keyboard control
+    "use_gamepad": True,
     
-    # === KEYBOARD SETTINGS ===
-    
-    # Enable keyboard control (requires pynput)
-    # Set to True to use WASD keys for control
+    # Enable keyboard control (always available as fallback)
     "use_keyboard": True,
     
     # Max forward/backward velocity (m/s) - scaled by left stick Y
@@ -74,6 +79,9 @@ CONFIG = {
     
     # Max angular velocity (rad/s) - scaled by right stick X  
     "max_ang_vel": 1.0,
+    
+    # Gain adjustment step size for keyboard (q/a keys)
+    "gain_step": 0.1,
     
     # Buttons: 0=A (bottom), 1=B (right), 2=X (left), 3=Y (top)
     # Option 1 (recommended): Use a single button to cycle through policies in order
@@ -270,6 +278,296 @@ JOINT_LIMITS = {
     "right_elbow_joint": (-1.0472, 2.0944),
     "right_wrist_roll_joint": (-1.97222, 1.97222),
 }
+
+
+class KeyboardController:
+    """Keyboard input handler using pynput library (no root required on Linux)."""
+    
+    def __init__(
+        self,
+        max_lin_vel: float,
+        max_lat_vel: float,
+        max_ang_vel: float,
+        policy_cycle: list[str] | None = None,
+        initial_policy_path: str | None = None,
+        gain_step: float = 0.1,
+    ):
+        if not KEYBOARD_AVAILABLE:
+            raise RuntimeError("pynput library not available. Install with: pip install pynput")
+        
+        self.max_lin_vel = max_lin_vel
+        self.max_lat_vel = max_lat_vel
+        self.max_ang_vel = max_ang_vel
+        self.policy_cycle = list(policy_cycle) if policy_cycle else []
+        self.gain_step = gain_step
+        
+        # Cycle state
+        self._cycle_index = 0
+        if self.policy_cycle and initial_policy_path is not None:
+            try:
+                self._cycle_index = self.policy_cycle.index(initial_policy_path)
+            except ValueError:
+                pass
+        
+        # Control mode state - 初始为 policy 模式（站立状态）
+        self._system_started = True  # 系统初始已启用
+        self.control_mode = "policy"  # 初始模式: policy (站立控制)
+        
+        # Track key states
+        self._pressed_keys = set()
+        
+        # Initialize key states - 新的键盘映射
+        self._key_states = {
+            # 方向键：前后左右移动
+            'up': False,      # 方向键上 - 前进
+            'down': False,    # 方向键下 - 后退
+            'left': False,    # 方向键左 - 左平移
+            'right': False,   # 方向键右 - 右平移
+            # 旋转控制
+            'z': False,       # Z - 左转
+            'c': False,       # C - 右转
+            # 模式切换 (IJK 对应原项目的 D-PAD, 移除L)
+            'i': False,       # I - 默认位置模式 (D-PAD UP)
+            'j': False,       # J - 阻尼模式 (D-PAD LEFT)
+            'k': False,       # K - 爬行位置模式 (D-PAD DOWN)
+            # 策略和系统控制
+            'space': False,   # SPACE - 循环切换策略
+            'esc': False,     # ESC - 退出程序
+            # 增益调整
+            'q': False,       # Q - 增加增益
+            'a': False,       # A - 减少增益
+            'h': False,       # H - 显示增益
+        }
+        
+        # Helper function to normalize key to string
+        def normalize_key(key):
+            if isinstance(key, pynput_keyboard.KeyCode):
+                try:
+                    return key.char.lower() if key.char else None
+                except AttributeError:
+                    return None
+            elif isinstance(key, pynput_keyboard.Key):
+                key_mapping = {
+                    pynput_keyboard.Key.space: 'space',
+                    pynput_keyboard.Key.esc: 'esc',
+                    pynput_keyboard.Key.up: 'up',
+                    pynput_keyboard.Key.down: 'down',
+                    pynput_keyboard.Key.left: 'left',
+                    pynput_keyboard.Key.right: 'right',
+                }
+                return key_mapping.get(key, None)
+            return None
+        
+        # Create keyboard listener (non-blocking)
+        def on_press(key):
+            self._pressed_keys.add(key)
+            key_str = normalize_key(key)
+            if key_str and key_str in self._key_states:
+                self._key_states[key_str] = True
+        
+        def on_release(key):
+            self._pressed_keys.discard(key)
+            key_str = normalize_key(key)
+            if key_str and key_str in self._key_states:
+                self._key_states[key_str] = False
+        
+        self._listener = pynput_keyboard.Listener(
+            on_press=on_press,
+            on_release=on_release,
+            suppress=False
+        )
+        self._listener.start()
+        
+        # Initialize previous states for edge detection
+        self._prev_space_state = False
+        self._prev_esc_state = False
+        self._prev_i_state = False
+        self._prev_j_state = False
+        self._prev_k_state = False
+        self._prev_q_state = False
+        self._prev_a_state = False
+        self._prev_h_state = False
+        
+        # Print control mapping
+        print()
+        print("=" * 60)
+        print("[KEYBOARD] Controls")
+        print("=" * 60)
+        print("  Movement (Arrow Keys):")
+        print("    ↑/↓: Forward/Backward")
+        print("    ←/→: Strafe Left/Right")
+        print("    Z/C: Rotate Left/Right")
+        print()
+        print("  Mode Switching (IJK, matching D-PAD):")
+        print("    I: Default Position mode (stand)")
+        print("    J: Damped mode (safe stop)")
+        print("    K: Crawl Position mode")
+        print("    (Note: Robot starts in policy/standing mode)")
+        print()
+        if self.policy_cycle:
+            print(f"  Policy Control:")
+            print(f"    SPACE: Cycle through {len(self.policy_cycle)} policies")
+            for idx, policy_path in enumerate(self.policy_cycle):
+                policy_name = Path(policy_path).stem
+                marker = "<- current" if idx == self._cycle_index else ""
+                print(f"      [{idx}] {policy_name} {marker}")
+        print()
+        print("  Gain Adjustment:")
+        print(f"    Q: Increase gain multiplier (+{self.gain_step})")
+        print(f"    A: Decrease gain multiplier (-{self.gain_step})")
+        print("    H: Print current gain multiplier")
+        print()
+        print("  Exit:")
+        print("    ESC: Exit simulation")
+        print()
+        print("=" * 60)
+        print()
+    
+    def get_velocity_commands(self) -> tuple[float, float, float]:
+        """Get velocity commands from keyboard.
+        Only active in Neural Network mode.
+        
+        Returns:
+            (lin_vel_z, lin_vel_y, ang_vel_x): Forward velocity, lateral velocity, and angular velocity
+        """
+        # Only provide velocity commands in policy mode
+        if self.control_mode != "policy":
+            return 0.0, 0.0, 0.0
+        
+        lin_vel_z = 0.0
+        lin_vel_y = 0.0
+        ang_vel_x = 0.0
+        
+        # Forward/Backward (↑/↓)
+        if self._key_states.get('up', False):
+            lin_vel_z = self.max_lin_vel
+        elif self._key_states.get('down', False):
+            lin_vel_z = -self.max_lin_vel
+        
+        # Strafe Left/Right (←/→)
+        if self._key_states.get('left', False):
+            lin_vel_y = self.max_lat_vel
+        elif self._key_states.get('right', False):
+            lin_vel_y = -self.max_lat_vel
+        
+        # Rotate Left/Right (Z/C)
+        if self._key_states.get('z', False):
+            ang_vel_x = self.max_ang_vel
+        elif self._key_states.get('c', False):
+            ang_vel_x = -self.max_ang_vel
+        
+        return lin_vel_z, lin_vel_y, ang_vel_x
+    
+    def check_exit(self) -> bool:
+        """Check if ESC key was pressed to exit.
+        
+        Returns:
+            True if exit key was pressed, False otherwise
+        """
+        current_state = self._key_states.get('esc', False)
+        previous_state = self._prev_esc_state
+        
+        if current_state and not previous_state:
+            print("\n[KEYBOARD] ESC pressed - shutting down...")
+            self._prev_esc_state = current_state
+            return True
+        
+        self._prev_esc_state = current_state
+        return False
+    
+    def check_mode_switch(self) -> str | None:
+        """Check if mode switch keys (IJK) were pressed.
+        
+        Returns:
+            Mode name if switched, None otherwise
+        """
+        # I - Default Position mode
+        current_i = self._key_states.get('i', False)
+        if current_i and not self._prev_i_state:
+            self.control_mode = "default_pos"
+            print(f"[KEYBOARD] I pressed -> Switched to DEFAULT POSITION mode")
+            self._prev_i_state = current_i
+            return "default_pos"
+        self._prev_i_state = current_i
+        
+        # J - Damped mode
+        current_j = self._key_states.get('j', False)
+        if current_j and not self._prev_j_state:
+            self.control_mode = "damped"
+            print(f"[KEYBOARD] J pressed -> Switched to DAMPED mode")
+            self._prev_j_state = current_j
+            return "damped"
+        self._prev_j_state = current_j
+        
+        # K - Crawl Position mode
+        current_k = self._key_states.get('k', False)
+        if current_k and not self._prev_k_state:
+            self.control_mode = "crawl_pos"
+            print(f"[KEYBOARD] K pressed -> Switched to CRAWL POSITION mode")
+            self._prev_k_state = current_k
+            return "crawl_pos"
+        self._prev_k_state = current_k
+        
+        return None
+    
+    def check_policy_switch(self) -> str | None:
+        """Check if SPACE key was pressed to switch policy.
+        Only works in policy mode.
+        
+        Returns:
+            Policy path if key pressed, None otherwise
+        """
+        if not self.policy_cycle or self.control_mode != "policy":
+            return None
+        
+        current_state = self._key_states.get('space', False)
+        previous_state = self._prev_space_state
+        
+        if current_state and not previous_state:
+            # Advance cycle index and return next policy
+            self._cycle_index = (self._cycle_index + 1) % len(self.policy_cycle)
+            next_policy = self.policy_cycle[self._cycle_index]
+            policy_name = Path(next_policy).stem
+            print(f"[KEYBOARD] SPACE pressed -> cycling to [{self._cycle_index}] {policy_name}")
+            self._prev_space_state = current_state
+            return next_policy
+        
+        self._prev_space_state = current_state
+        return None
+    
+    def check_gain_adjustment(self) -> tuple[float | None, bool]:
+        """Check if Q/A/H keys were pressed for gain adjustment.
+        
+        Returns:
+            (gain_delta, should_print): gain_delta is None if no change, should_print is True if H was pressed
+        """
+        # Q - Increase gain
+        current_q = self._key_states.get('q', False)
+        if current_q and not self._prev_q_state:
+            self._prev_q_state = current_q
+            return self.gain_step, False
+        self._prev_q_state = current_q
+        
+        # A - Decrease gain
+        current_a = self._key_states.get('a', False)
+        if current_a and not self._prev_a_state:
+            self._prev_a_state = current_a
+            return -self.gain_step, False
+        self._prev_a_state = current_a
+        
+        # H - Print gain
+        current_h = self._key_states.get('h', False)
+        if current_h and not self._prev_h_state:
+            self._prev_h_state = current_h
+            return None, True
+        self._prev_h_state = current_h
+        
+        return None, False
+    
+    def cleanup(self):
+        """Stop the keyboard listener."""
+        if hasattr(self, '_listener'):
+            self._listener.stop()
 
 
 class GamepadController:
@@ -582,170 +880,6 @@ class GamepadController:
             except Exception:
                 # Suppress OpenGL context errors during cleanup (harmless)
                 pass
-
-
-class KeyboardController:
-    """Keyboard input handler using pynput."""
-    
-    def __init__(
-        self,
-        max_lin_vel: float,
-        max_lat_vel: float,
-        max_ang_vel: float,
-        policy_cycle: list[str],
-        initial_policy_path: str | None = None,
-    ):
-        self.max_lin_vel = max_lin_vel
-        self.max_lat_vel = max_lat_vel
-        self.max_ang_vel = max_ang_vel
-        self.policy_cycle = list(policy_cycle) if policy_cycle else []
-        
-        # Thread-safe state tracking
-        self._lock = threading.Lock()
-        self._keys_pressed = {}  # Track which keys are currently pressed
-        self._policy_switch_pressed = False  # Edge detection for Space key
-        self._exit_pressed = False  # Edge detection for Esc key
-        
-        # Cycle state
-        self._cycle_index = 0
-        if initial_policy_path is not None:
-            try:
-                self._cycle_index = self.policy_cycle.index(initial_policy_path)
-            except ValueError:
-                self._cycle_index = 0
-        
-        # Keyboard listener (will be started in start())
-        self._listener = None
-        
-        # Print control instructions
-        print("\n[KEYBOARD] Controls:")
-        print("  W/S: Forward/Backward")
-        print("  A/D: Turn Left/Right")
-        print("  Q/E: Strafe Left/Right")
-        print("  Space: Cycle through policies")
-        print("  Esc: Exit")
-        if self.policy_cycle:
-            print(f"\n[KEYBOARD] Policy cycle ({len(self.policy_cycle)} policies):")
-            for idx, policy_path in enumerate(self.policy_cycle):
-                policy_name = Path(policy_path).stem
-                marker = "<- start" if idx == self._cycle_index else ""
-                print(f"  [{idx}] {policy_name} {marker}")
-        print()
-    
-    def _on_press(self, key):
-        """Callback for key press events."""
-        try:
-            key_char = key.char if hasattr(key, 'char') and key.char else None
-            key_name = key.name if hasattr(key, 'name') else None
-            
-            with self._lock:
-                if key_char:
-                    self._keys_pressed[key_char.lower()] = True
-                elif key_name:
-                    self._keys_pressed[key_name] = True
-                
-                # Edge detection for Space (policy switch)
-                if key == keyboard.Key.space and not self._policy_switch_pressed:
-                    self._policy_switch_pressed = True
-                
-                # Edge detection for Esc (exit)
-                if key == keyboard.Key.esc and not self._exit_pressed:
-                    self._exit_pressed = True
-        except Exception:
-            # Ignore errors in key handler
-            pass
-    
-    def _on_release(self, key):
-        """Callback for key release events."""
-        try:
-            key_char = key.char if hasattr(key, 'char') and key.char else None
-            key_name = key.name if hasattr(key, 'name') else None
-            
-            with self._lock:
-                if key_char:
-                    self._keys_pressed.pop(key_char.lower(), None)
-                elif key_name:
-                    self._keys_pressed.pop(key_name, None)
-        except Exception:
-            # Ignore errors in key handler
-            pass
-    
-    def start(self):
-        """Start the keyboard listener."""
-        self._listener = keyboard.Listener(
-            on_press=self._on_press,
-            on_release=self._on_release
-        )
-        self._listener.start()
-    
-    def stop(self):
-        """Stop the keyboard listener."""
-        if self._listener:
-            self._listener.stop()
-            self._listener = None
-    
-    def get_velocity_commands(self) -> tuple[float, float, float]:
-        """Get velocity commands from keyboard.
-        
-        Returns:
-            (lin_vel_z, lin_vel_y, ang_vel_x): Forward velocity, lateral velocity, and angular velocity
-        """
-        with self._lock:
-            # Forward/backward (W/S)
-            if 'w' in self._keys_pressed:
-                lin_vel_z = self.max_lin_vel
-            elif 's' in self._keys_pressed:
-                lin_vel_z = -self.max_lin_vel
-            else:
-                lin_vel_z = 0.0
-            
-            # Lateral movement (Q/E)
-            if 'q' in self._keys_pressed:
-                lin_vel_y = self.max_lat_vel
-            elif 'e' in self._keys_pressed:
-                lin_vel_y = -self.max_lat_vel
-            else:
-                lin_vel_y = 0.0
-            
-            # Rotation (A/D)
-            if 'a' in self._keys_pressed:
-                ang_vel_x = self.max_ang_vel
-            elif 'd' in self._keys_pressed:
-                ang_vel_x = -self.max_ang_vel
-            else:
-                ang_vel_x = 0.0
-        
-        return lin_vel_z, lin_vel_y, ang_vel_x
-    
-    def check_policy_switch(self) -> str | None:
-        """Check if Space key was pressed to switch policy.
-        
-        Returns:
-            Policy path if Space was pressed, None otherwise
-        """
-        with self._lock:
-            if self._policy_switch_pressed:
-                self._policy_switch_pressed = False  # Reset edge detection
-                if self.policy_cycle:
-                    # Advance cycle index
-                    self._cycle_index = (self._cycle_index + 1) % len(self.policy_cycle)
-                    next_policy = self.policy_cycle[self._cycle_index]
-                    print(f"[KEYBOARD] Space pressed -> cycling to [{self._cycle_index}] {Path(next_policy).stem}")
-                    return next_policy
-            return None
-    
-    def check_exit(self) -> bool:
-        """Check if Esc key was pressed to exit.
-        
-        Returns:
-            True if Esc was pressed, False otherwise
-        """
-        with self._lock:
-            if self._exit_pressed:
-                self._exit_pressed = False  # Reset edge detection
-                print("\n[KEYBOARD] Esc pressed - shutting down...")
-                return True
-            return False
 
 
 def rpy_to_quat(roll: float, pitch: float, yaw: float) -> np.ndarray:
@@ -1293,7 +1427,6 @@ def main():
     init_pose_json = Path(CONFIG["init_pose_json"]) if CONFIG["init_pose_json"] else None
     
     use_gamepad = CONFIG["use_gamepad"]
-    use_keyboard = CONFIG.get("use_keyboard", False)
     max_lin_vel = CONFIG.get("max_lin_vel", 2.0)
     max_lat_vel = CONFIG.get("max_lat_vel", 1.5)
     max_ang_vel = CONFIG.get("max_ang_vel", 1.5)
@@ -1368,6 +1501,7 @@ def main():
     
     # Initialize gamepad if enabled
     gamepad = None
+    keyboard = None
     if use_gamepad:
         try:
             gamepad = GamepadController(
@@ -1389,22 +1523,11 @@ def main():
             print("[INFO] Falling back to keyboard control")
             use_gamepad = False
     
-    # Initialize keyboard if enabled and gamepad is not used
-    keyboard_controller = None
-    if not use_gamepad and use_keyboard:
-        try:
-            keyboard_controller = KeyboardController(
-                max_lin_vel=max_lin_vel,
-                max_lat_vel=max_lat_vel,
-                max_ang_vel=max_ang_vel,
-                policy_cycle=policy_cycle or [],
-                initial_policy_path=str(policy_path),
-            )
-            keyboard_controller.start()
-            print("[INFO] Keyboard initialized - using WASD keys for control")
-        except Exception as e:
-            print(f"[WARN] Keyboard initialization failed: {e}")
-            use_keyboard = False
+    # Initialize keyboard if gamepad not available or keyboard explicitly enabled
+    use_keyboard = CONFIG.get("use_keyboard", True)
+    if (not use_gamepad and use_keyboard) or (use_gamepad and use_keyboard):
+        # Will initialize after viewer is created (need window handle)
+        pass
     
     # Create controller
     print("[INFO] Creating policy controller...")
@@ -1478,19 +1601,98 @@ def main():
         v.cam.azimuth = camera_azimuth
         v.cam.elevation = camera_elevation
         
+        # Initialize keyboard controller if needed
+        gain_step = CONFIG.get("gain_step", 0.1)
+        if (not use_gamepad and use_keyboard) or (use_gamepad and use_keyboard):
+            try:
+                keyboard = KeyboardController(
+                    max_lin_vel=max_lin_vel,
+                    max_lat_vel=max_lat_vel,
+                    max_ang_vel=max_ang_vel,
+                    policy_cycle=policy_cycle,
+                    initial_policy_path=str(policy_path),
+                    gain_step=gain_step,
+                )
+                if not use_gamepad:
+                    print("[INFO] Keyboard control enabled")
+            except RuntimeError as e:
+                print(f"[WARN] Keyboard initialization failed: {e}")
+                print("[INFO] Install pynput with: pip install pynput")
+                keyboard = None
+        
         print("[INFO] Viewer launched. Running policy...")
         print(f"[INFO] Camera: distance={camera_distance}m, azimuth={camera_azimuth}°, tracking={camera_tracking}")
-        if not use_gamepad and not use_keyboard:
-            print("[INFO] No gamepad or keyboard - robot will stand still")
+        if not use_gamepad and not keyboard:
+            print("[INFO] No input device - robot will stand still")
         
         step = 0
         lin_vel_z = 0.0
         lin_vel_y = 0.0
         ang_vel_x = 0.0
         
+        # Control mode state (for keyboard) - 初始为 policy 模式（站立状态）
+        control_mode = "policy"  # 初始模式: policy (站立控制)
+        
+        # Helper function to set joint targets from angle dict
+        def set_joint_targets_from_dict(angle_dict: dict[str, float], mj_model, data, controller):
+            """Set joint targets from a dictionary of joint names to angles."""
+            for i, joint_name in enumerate(controller.joint_names):
+                if joint_name in angle_dict:
+                    # Find the joint index in MuJoCo
+                    joint_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+                    if joint_id >= 0:
+                        # Set control target (qpos index is 7 + i for robot joints)
+                        if i < controller.num_robot_joints:
+                            data.ctrl[i] = angle_dict[joint_name]
+        
         while v.is_running():
-            # Get velocity commands from gamepad or keyboard
+            # Poll GLFW events to update gamepad state (keyboard library handles its own polling)
             if gamepad:
+                glfw.poll_events()
+            
+            # Handle keyboard controls
+            if keyboard:
+                # Check exit (ESC key)
+                if keyboard.check_exit():
+                    break
+                
+                # Check mode switch (IJK keys)
+                new_mode = keyboard.check_mode_switch()
+                if new_mode:
+                    control_mode = new_mode
+                    keyboard.control_mode = new_mode
+                
+                # Check gain adjustment (Q/A/H keys)
+                gain_delta, should_print_gain = keyboard.check_gain_adjustment()
+                if gain_delta is not None:
+                    # Adjust gains
+                    new_kp_legs = controller.kp_multiplier_legs + gain_delta
+                    new_kd_legs = controller.kd_multiplier_legs + gain_delta
+                    new_kp_upper = controller.kp_multiplier_upper + gain_delta
+                    new_kd_upper = controller.kd_multiplier_upper + gain_delta
+                    controller.set_gain_multipliers(
+                        kp_multiplier_legs=max(0.0, new_kp_legs),
+                        kd_multiplier_legs=max(0.0, new_kd_legs),
+                        kp_multiplier_upper=max(0.0, new_kp_upper),
+                        kd_multiplier_upper=max(0.0, new_kd_upper),
+                    )
+                    print(f"[KEYBOARD] Gain multiplier updated: legs={controller.kp_multiplier_legs:.2f}, upper={controller.kp_multiplier_upper:.2f}")
+                elif should_print_gain:
+                    print(f"[KEYBOARD] Current gain multiplier: legs={controller.kp_multiplier_legs:.2f}, upper={controller.kp_multiplier_upper:.2f}")
+                
+                # Get velocity commands (only in policy mode)
+                if control_mode == "policy":
+                    lin_vel_z, lin_vel_y, ang_vel_x = keyboard.get_velocity_commands()
+                    
+                    # Check for policy switch (only in policy mode)
+                    new_policy_path = keyboard.check_policy_switch()
+                    if new_policy_path:
+                        controller.load_policy(Path(new_policy_path))
+                else:
+                    lin_vel_z, lin_vel_y, ang_vel_x = 0.0, 0.0, 0.0
+            
+            # Handle gamepad controls
+            elif gamepad:
                 lin_vel_z, lin_vel_y, ang_vel_x = gamepad.get_velocity_commands()
                 
                 # Print debug info (catches unmapped buttons)
@@ -1506,40 +1708,44 @@ def main():
                     # Don't terminate GLFW yet - viewer is still using it
                     # Just mark gamepad as done and break
                     break
-            elif keyboard_controller:
-                lin_vel_z, lin_vel_y, ang_vel_x = keyboard_controller.get_velocity_commands()
-                
-                # Check for policy switch
-                new_policy_path = keyboard_controller.check_policy_switch()
-                if new_policy_path:
-                    controller.load_policy(Path(new_policy_path))
-                
-                # Check for exit
-                if keyboard_controller.check_exit():
-                    break
+            
+            # Handle different control modes (keyboard only)
+            if keyboard and control_mode != "policy":
+                if control_mode == "default_pos":
+                    # Set to default standing position
+                    set_joint_targets_from_dict(STAND_DEFAULT_ANGLES, mj_model, data, controller)
+                elif control_mode == "crawl_pos":
+                    # Set to crawl position (use training defaults which is crawl pose)
+                    set_joint_targets_from_dict(TRAINING_DEFAULT_ANGLES, mj_model, data, controller)
+                elif control_mode == "damped":
+                    # Damped mode: set all controls to zero (high damping)
+                    data.ctrl[:controller.num_robot_joints] = 0.0
+                # policy mode is handled below
             
             # Get robot state
             root_quat = data.qpos[3:7]
             joint_pos = data.qpos[7:7+controller.num_robot_joints]
             joint_vel = data.qvel[6:6+controller.num_robot_joints]  # Skip free joint velocities
             
-            # Compute projected gravity
-            proj_gravity = compute_projected_gravity(root_quat)
-            
-            # Get observation
-            obs = controller.get_observation(
-                projected_gravity=proj_gravity,
-                joint_pos=joint_pos,
-                joint_vel=joint_vel,
-                lin_vel_z=lin_vel_z,
-                lin_vel_y=lin_vel_y,
-                ang_vel_x=ang_vel_x,
-            )
-            
-            # Get action from policy (every n_substeps)
-            if step % n_substeps == 0:
-                joint_targets = controller.get_action(obs, joint_pos, joint_vel)
-                data.ctrl[:controller.num_robot_joints] = joint_targets
+            # Only run policy in policy mode
+            if (keyboard and control_mode == "policy") or (gamepad and not keyboard):
+                # Compute projected gravity
+                proj_gravity = compute_projected_gravity(root_quat)
+                
+                # Get observation
+                obs = controller.get_observation(
+                    projected_gravity=proj_gravity,
+                    joint_pos=joint_pos,
+                    joint_vel=joint_vel,
+                    lin_vel_z=lin_vel_z,
+                    lin_vel_y=lin_vel_y,
+                    ang_vel_x=ang_vel_x,
+                )
+                
+                # Get action from policy (every n_substeps)
+                if step % n_substeps == 0:
+                    joint_targets = controller.get_action(obs, joint_pos, joint_vel)
+                    data.ctrl[:controller.num_robot_joints] = joint_targets
             
             # Step simulation
             mujoco.mj_step(mj_model, data)
@@ -1560,9 +1766,9 @@ def main():
             #     vel_str = f"vel=[{lin_vel_z:.2f}, {ang_vel_x:.2f}]" if use_gamepad else ""
             #     print(f"Step {step}: pos=[{root_pos[0]:.2f}, {root_pos[1]:.2f}, {root_pos[2]:.2f}] {vel_str}")
     
-    # Cleanup keyboard controller
-    if keyboard_controller:
-        keyboard_controller.stop()
+    # Cleanup keyboard listener if it was created
+    if keyboard and hasattr(keyboard, 'cleanup'):
+        keyboard.cleanup()
     
     # Don't need to explicitly cleanup gamepad - GLFW is shared with viewer
     # and will be cleaned up automatically when the process exits

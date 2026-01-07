@@ -80,6 +80,11 @@ python sim2sim_mj/run_sim2sim.py
    - Analog sticks provide velocity commands if a standard-mapped gamepad is connected.
    - Optional CSV diagnostics are written under `outputs/diagnostics/` when enabled.
 
+#### Keyboard Control (Optional)
+For keyboard-based control without a gamepad, see [KEYBOARD_SIM2SIM.md](KEYBOARD_SIM2SIM.md).
+
+This feature provides an alternative input method using standard keyboard keys (arrow keys, IJK, Z/C, SPACE, Q/A/H, ESC) for controlling the robot in MuJoCo simulation. It's particularly useful for laptops, remote machines, and development setups where a physical gamepad is unavailable.
+
 ### Real Robot Deployment (`deployment/`)
 - The `deployment/` folder contains scripts/configs intended for running policies on the physical robot.
 - These expect robot-side connectivity, drivers, and safety layers (e.g., actuator PD settings, watchdogs).
